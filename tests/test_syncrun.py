@@ -2,7 +2,9 @@ import pytest
 
 from seestar_sync.archive import Archive
 from seestar_sync.config import Config
+from seestar_sync.device import DeviceUnavailable
 from seestar_sync.manifest import Manifest
+from seestar_sync.models import DeviceFile
 from seestar_sync.syncrun import run_sync
 from tests.fakes import FakeDevice
 
@@ -47,6 +49,7 @@ def test_copies_everything_and_verifies(env):
     s = run_sync(d, archive, manifest, config(), now=1_000_000.0)
     assert s.result == "ok"
     assert s.files_copied == 2
+    assert s.bytes_copied == 303  # 300 (raw) + 3 (jpg) — exact-content bar
     assert archive.dest_path("M 81/DSO_Stacked_1_M 81_10.0s_20250101_000000.jpg").exists()
     # second run: nothing new to do
     s2 = run_sync(d, archive, manifest, config(), now=1_000_100.0)
@@ -60,6 +63,8 @@ def test_reclaim_deletes_only_verified_with_write_ahead_audit(env):
     s1 = run_sync(d, archive, manifest, config(), now=1_000_000.0)
     assert s1.files_copied == 1
     assert s1.files_deleted == 1  # verified this run, then reclaimed under pressure
+    assert s1.bytes_reclaimed == 800
+    assert s1.device_used_percent == 80.0  # measured before deletions
     assert d.list_files() == []  # gone from device
     row = manifest.get("M 81_sub/Light_a_20250101-000000.fit")
     assert row.deleted_from_device_at is not None and row.deleted_tier == 1
@@ -87,6 +92,38 @@ def test_mid_run_disconnect_keeps_partial_progress(env):
     assert s.files_copied == 1  # first banked before the "power-off"
     assert s.result == "ok"  # clean disconnect, no errors
     assert s.files_deleted == 0  # reclaim skipped once device vanished
+
+
+def test_mid_read_disconnect_banks_progress(env):
+    # the open succeeds, the STREAM dies (canonical mid-transfer power-off):
+    # must abort cleanly with banked progress and no .part debris, not crash
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000)
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * 10, mtime=1.0)
+    d.put("B_sub/Light_b_20250102-000000.fit", b"b" * 10, mtime=1.0)
+    d.fail_mid_read_paths.add("B_sub/Light_b_20250102-000000.fit")
+    s = run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    assert s.result == "ok"
+    assert s.files_copied == 1  # A banked before B's stream died
+    assert not archive.dest_path("B_sub/Light_b_20250102-000000.fit").exists()
+    assert not list((archive.root / "MyWorks" / "B_sub").glob("*.part"))
+
+
+def test_unmeasurable_free_space_surfaces_as_error(env):
+    # a blinded reclaim must alert (partial → Kuma silence), never report ok
+    archive, manifest = env
+    from seestar_sync.device import FreeSpaceUnavailable
+
+    class BlindDevice(FakeDevice):
+        def disk_usage(self):
+            raise FreeSpaceUnavailable("stat_volume unsupported, DEVICE_CAPACITY_GB unset")
+
+    d = BlindDevice(capacity=100_000)
+    d.put("M 81_sub/Light_a_20250101-000000.fit", b"x" * 10, mtime=1.0)
+    s = run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    assert s.result == "partial"
+    assert s.files_copied == 1  # copying still works; only reclaim is blinded
+    assert any("free space" in e for e in s.errors)
 
 
 def test_verify_failure_counts_and_eventually_skips(env):
@@ -165,3 +202,63 @@ def test_dry_run_touches_nothing(env):
     assert s.files_copied == 1  # planned counts, for visibility
     assert not archive.dest_path("M 81_sub/Light_a_20250101-000000.fit").exists()
     assert len(d.list_files()) == 1  # nothing deleted
+
+
+def test_dry_run_reclaim_reports_plan_without_touching_anything(env):
+    # the rollout graduation gate: the operator eyeballs dry-run DELETION
+    # plans before enabling reclaim — this branch must report accurately
+    # while executing nothing (including no audit rows)
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000)
+    path = "M 81_sub/Light_a_20250101-000000.fit"
+    d.put(path, b"x" * 8000, mtime=1.0)
+    run_sync(d, archive, manifest, config(), now=1_000_000.0)  # copy + verify
+    d.capacity = 10_000  # now 80% used → reclaim pressure
+    s = run_sync(d, archive, manifest, config(DRY_RUN="true"), now=1_000_100.0)
+    assert s.dry_run is True
+    assert s.files_deleted == 1 and s.bytes_reclaimed == 8000  # plan reported
+    assert len(d.list_files()) == 1  # nothing actually deleted
+    assert manifest.get(path).deleted_from_device_at is None  # no audit row
+
+
+def test_changed_file_is_skipped_at_delete_time(env):
+    # spec hard precondition: fresh stat must still match what was verified —
+    # and the skip must happen BEFORE mark_deleted writes an audit row
+    archive, manifest = env
+
+    class DriftingDevice(FakeDevice):
+        def stat(self, path):
+            f = super().stat(path)
+            return DeviceFile(f.path, f.size, f.mtime + 100.0)  # device rewrote it
+
+    d = DriftingDevice(capacity=100_000)
+    path = "M 81_sub/Light_a_20250101-000000.fit"
+    d.put(path, b"x" * 8000, mtime=1.0)
+    run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    d.capacity = 10_000
+    s = run_sync(d, archive, manifest, config(), now=1_000_100.0)
+    assert s.files_deleted == 0
+    assert len(d.list_files()) == 1  # file survives
+    assert manifest.get(path).deleted_from_device_at is None  # no audit row
+
+
+def test_disconnect_during_delete_leaves_self_healing_audit(env):
+    # the real crash window (not forged state): device dies between the
+    # write-ahead audit commit and the SMB delete → clean abort, audit
+    # stands, file survives — exactly the self-healing false-delete state
+    archive, manifest = env
+
+    class DisconnectingOnDelete(FakeDevice):
+        def delete_file(self, path):
+            raise DeviceUnavailable("power-off mid-delete")
+
+    d = DisconnectingOnDelete(capacity=100_000)
+    path = "M 81_sub/Light_a_20250101-000000.fit"
+    d.put(path, b"x" * 8000, mtime=1.0)
+    run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    d.capacity = 10_000
+    s = run_sync(d, archive, manifest, config(), now=1_000_100.0)
+    assert s.result == "ok" and s.errors == []  # clean abort, not an error
+    assert s.files_deleted == 0
+    assert manifest.get(path).deleted_from_device_at is not None  # audit stands
+    assert len(d.list_files()) == 1  # file still on device

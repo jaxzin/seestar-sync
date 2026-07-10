@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from .archive import Archive, VerifyError
 from .classify import active_folders, top_folder
 from .config import Config
-from .device import DeviceClient, DeviceUnavailable
+from .device import DeviceClient, DeviceUnavailable, FreeSpaceUnavailable
 from .manifest import Manifest
 from .models import RunSummary, Tier
 from .planner import plan_copies
@@ -42,6 +42,12 @@ def run_sync(
     now: float | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> RunSummary:
+    """Execute one sync pass and return its summary.
+
+    should_stop is a cooperative shutdown check, polled between files (copy
+    phase) and between deletions (reclaim phase) — it never tears an
+    in-flight transfer or splits the audit→delete pair.
+    """
     now = time.time() if now is None else now
     should_stop = should_stop or (lambda: False)
     summary = RunSummary(started_at=iso(now), result="ok", dry_run=config.dry_run)
@@ -80,9 +86,9 @@ def _copy_phase(
             log.info("shutdown requested; stopping copy phase between files")
             break
         if manifest.failure_count(f.path) >= MAX_VERIFY_FAILURES:
-            summary.errors.append(
-                f"{f.path}: {MAX_VERIFY_FAILURES} consecutive verify failures, skipping"
-            )
+            msg = f"{f.path}: {MAX_VERIFY_FAILURES} consecutive verify failures, skipping"
+            log.warning(msg)  # errors[] alone is invisible in container logs
+            summary.errors.append(msg)
             continue
         if config.dry_run:
             log.info("DRY_RUN would copy %s (%d bytes)", f.path, f.size)
@@ -100,7 +106,9 @@ def _copy_phase(
             return True
         except VerifyError as e:
             count = manifest.bump_failure(f.path)
-            summary.errors.append(f"verify failed ({count}/{MAX_VERIFY_FAILURES}): {e}")
+            msg = f"verify failed ({count}/{MAX_VERIFY_FAILURES}): {e}"
+            log.warning(msg)  # errors[] alone is invisible in container logs
+            summary.errors.append(msg)
             continue
         manifest.record_verified(f.path, f.size, f.mtime, sha, iso(now))
         manifest.clear_failure(f.path)
@@ -124,6 +132,11 @@ def _reclaim_phase(
             is_verified=lambda f: manifest.verified_ok(f.path, f.size, f.mtime),
             active=active,
         )
+        if not plan:
+            log.info(
+                "device at %.1f%% used (trigger %.0f%%): no reclaim needed",
+                usage.used_percent, config.reclaim_trigger_percent,
+            )
         emptied_sub_folders: set[str] = set()
         for d in plan:
             if should_stop():
@@ -159,5 +172,12 @@ def _reclaim_phase(
         for folder in sorted(emptied_sub_folders):
             if device.remove_dir_if_empty(folder):
                 log.info("removed empty folder %s", folder)
+    except FreeSpaceUnavailable as e:
+        # NOT a routine device-off: reclaim is blinded by config/firmware.
+        # Must surface as partial so Kuma goes silent and the operator is
+        # alerted — otherwise the device fills while monitoring stays green.
+        msg = f"free space unmeasurable, reclaim skipped: {e}"
+        log.error(msg)
+        summary.errors.append(msg)
     except DeviceUnavailable as e:
         log.info("device vanished during reclaim (%s), stopping cleanly", e)
