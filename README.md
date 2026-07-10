@@ -29,8 +29,25 @@ for in-app browsing are never touched, and never even reachable by the deleter.
 4. Start the daemon:
 
    ```bash
-   docker compose up -d
+   docker compose up -d --build
    ```
+
+   (`--build` is a no-op on a fresh checkout — compose builds the image the first
+   time anyway — but it's load-bearing when upgrading; see below.)
+
+## Upgrading
+
+Upgrading an existing deployment requires a rebuild:
+
+```bash
+docker compose up -d --build
+```
+
+Compose does **not** rebuild the image on its own — a plain `docker compose up -d`
+restarts the *old* image, and any environment variables the old version never read
+(e.g. the `MQTT_*` vars added in v0.2) are silently ignored: the container comes up
+looking healthy while the new feature simply doesn't exist. Always pass `--build`
+when upgrading.
 
 ## Rollout sequence
 
@@ -188,7 +205,7 @@ All reporters are fire-and-forget: a reporter failure (network error, bad URL, e
 logged as a warning and never affects the run's exit code.
 
 Third-party protocol libraries (`smbprotocol`, `spnego`, `paho`) are quieted to
-`WARNING` regardless of `LOG_LEVEL`, since their per-packet chatter at `INFO`/`DEBUG`
+`WARNING` unless `LOG_LEVEL=DEBUG`, since their per-packet chatter at `INFO`/`DEBUG`
 drowns the operator-facing log narrative. Set `LOG_LEVEL=DEBUG` to re-enable their
 verbose logging when debugging the SMB or MQTT wire protocol directly.
 
@@ -205,12 +222,12 @@ point `MQTT_HOST` at an anonymous/unauthenticated broker).
 18 entities are published under the device, split across the areas HA groups by:
 
 **Live state**
-- **Daemon online** (`binary_sensor`) — the alertable liveness signal, driven by MQTT's
-  Last Will (LWT): if the daemon dies (crash, `docker stop`, `SIGKILL`, network drop)
-  without a clean disconnect, the broker flips this off automatically, and every other
-  entity greys out in HA because they share the same availability topic. Uptime Kuma
-  remains the independent, MQTT-broker-agnostic alarm — losing MQTT doesn't lose your
-  alerting.
+- **Daemon online** (`binary_sensor`) — the alertable liveness signal. A graceful stop
+  (`docker stop` / `SIGTERM`) publishes `offline` explicitly before a clean disconnect;
+  if the daemon dies *ungracefully* (crash, `SIGKILL`, network drop), MQTT's Last Will
+  (LWT) has the broker flip it off automatically. Either way, every other entity greys
+  out in HA because they share the same availability topic. Uptime Kuma remains the
+  independent, MQTT-broker-agnostic alarm — losing MQTT doesn't lose your alerting.
 - **State** — `listing` / `copying` / `reclaiming` / `idle` / `unreachable` / `error`.
 - **Progress** (%) — updated at most once every 10 seconds while a phase is in
   progress; a *phase change* (e.g. `copying` → `reclaiming`) always publishes
@@ -237,9 +254,14 @@ overrides, not live config edits:
   metadata directory and takes effect at the **start of the next pass** — never
   mid-pass, so a change made while a copy is running can't half-apply.
 - Precedence is **override > env default**, resolved once per pass into a snapshot.
-  An override survives daemon restarts (it's a file, not in-memory state); to go back
-  to the env-var value, clear it from HA (there's no "unset" gesture from the switch/text
-  UI today — edit `settings.json` directly, or redeploy with the override key removed).
+  An override survives daemon restarts *and* redeploys — it's a file on the archive
+  volume, not in-memory state. To revert a setting to its env value, remove its key
+  from `settings.json` (or delete the file — all overrides revert to env); the next
+  pass picks it up, no restart needed. There is no "unset" gesture in HA today —
+  setting the entity back to the env value also works, but `status` will keep
+  reporting the source as `mqtt override`.
+- Overrides are mode-independent: a one-shot `seestar-sync run` (cron/CronJob) applies
+  the same `settings.json` overrides even though MQTT itself is daemon-only.
 - `seestar-sync status` shows both the effective value and where it came from, e.g.:
 
   ```
