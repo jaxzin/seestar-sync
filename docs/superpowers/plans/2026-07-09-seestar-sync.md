@@ -103,7 +103,7 @@ __pycache__/
 dist/
 ```
 
-Ensure `src/seestar_sync/__init__.py` exists and is empty (delete any `uv init` sample code like `py.typed` demo functions; keep `py.typed` if generated). Delete any generated sample test.
+Ensure `src/seestar_sync/__init__.py` exists and is empty (delete any `uv init` sample code like `py.typed` demo functions; keep `py.typed` if generated). Delete any generated sample test. Create a stub `README.md` (just `# seestar-sync` + one sentence) — pyproject's `readme` field makes the build fail on a fresh clone without it; Task 12 replaces its content at the same path. Keep and commit `.python-version` (it's a reproducibility pin).
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -157,6 +157,39 @@ def test_bool_parsing_accepts_common_truthy_values():
 def test_non_numeric_interval_is_fatal():
     with pytest.raises(ConfigError, match="SYNC_INTERVAL_MINUTES"):
         Config.from_env(base_env(SYNC_INTERVAL_MINUTES="soon"))
+
+
+def test_non_numeric_capacity_is_fatal():
+    with pytest.raises(ConfigError, match="DEVICE_CAPACITY_GB"):
+        Config.from_env(base_env(DEVICE_CAPACITY_GB="lots"))
+
+
+def test_non_positive_capacity_and_window_are_fatal():
+    with pytest.raises(ConfigError, match="DEVICE_CAPACITY_GB"):
+        Config.from_env(base_env(DEVICE_CAPACITY_GB="0"))
+    # the session guard is a delete-safety feature; it must never be disabled
+    with pytest.raises(ConfigError, match="ACTIVE_WINDOW_MINUTES"):
+        Config.from_env(base_env(ACTIVE_WINDOW_MINUTES="0"))
+
+
+def test_webhook_urls_must_be_http():
+    with pytest.raises(ConfigError, match="KUMA_PUSH_URL"):
+        Config.from_env(base_env(KUMA_PUSH_URL="file:///etc/passwd"))
+    cfg = Config.from_env(base_env(HA_WEBHOOK_URL="https://ha.local/api/webhook/x"))
+    assert cfg.ha_webhook_url == "https://ha.local/api/webhook/x"
+
+
+def test_garbage_bool_is_fatal():
+    for raw in ("0", "no", "off"):
+        assert Config.from_env(base_env(DRY_RUN=raw)).dry_run is False
+    with pytest.raises(ConfigError, match="DRY_RUN"):
+        Config.from_env(base_env(DRY_RUN="maybe"))
+
+
+def test_non_positive_interval_is_fatal():
+    for raw in ("0", "-5"):
+        with pytest.raises(ConfigError, match="SYNC_INTERVAL_MINUTES"):
+            Config.from_env(base_env(SYNC_INTERVAL_MINUTES=raw))
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -190,7 +223,9 @@ def _bool(env: Mapping[str, str], key: str) -> bool:
         return True
     if raw in _FALSY:
         return False
-    raise ConfigError(f"{key} must be a boolean, got {raw!r}")
+    raise ConfigError(
+        f"{key} must be a boolean (accepted: 1/true/yes/on or 0/false/no/off), got {raw!r}"
+    )
 
 
 def _number(env: Mapping[str, str], key: str, default: str, cast) -> float | int:
@@ -198,7 +233,18 @@ def _number(env: Mapping[str, str], key: str, default: str, cast) -> float | int
     try:
         return cast(raw)
     except ValueError as e:
-        raise ConfigError(f"{key} must be a number, got {raw!r}") from e
+        kind = "an integer" if cast is int else "a number"
+        raise ConfigError(f"{key} must be {kind}, got {raw!r}") from e
+
+
+def _http_url(env: Mapping[str, str], key: str) -> str | None:
+    """Webhook URLs must be http(s): urllib would happily open file:// etc."""
+    url = env.get(key, "").strip()
+    if not url:
+        return None
+    if not url.startswith(("http://", "https://")):
+        raise ConfigError(f"{key} must be an http:// or https:// URL, got {url!r}")
+    return url
 
 
 @dataclass(frozen=True)
@@ -220,7 +266,9 @@ class Config:
     def from_env(cls, env: Mapping[str, str]) -> "Config":
         host = env.get("SEESTAR_HOST", "").strip()
         if not host:
-            raise ConfigError("SEESTAR_HOST is required")
+            raise ConfigError(
+                "SEESTAR_HOST is required — set it to the telescope's hostname or IP"
+            )
 
         trigger = _number(env, "RECLAIM_TRIGGER_PERCENT", "75", float)
         target = _number(env, "RECLAIM_TARGET_PERCENT", "60", float)
@@ -230,19 +278,34 @@ class Config:
                 f"and both in (0, 100]; got target={target}, trigger={trigger}"
             )
 
-        capacity_raw = env.get("DEVICE_CAPACITY_GB", "").strip()
-        capacity = float(capacity_raw) if capacity_raw else None
+        capacity = (
+            float(_number(env, "DEVICE_CAPACITY_GB", "0", float))
+            if env.get("DEVICE_CAPACITY_GB", "").strip()
+            else None
+        )
+        if capacity is not None and capacity <= 0:
+            raise ConfigError(f"DEVICE_CAPACITY_GB must be positive, got {capacity}")
+
+        interval = int(_number(env, "SYNC_INTERVAL_MINUTES", "15", int))
+        if interval < 1:
+            raise ConfigError(f"SYNC_INTERVAL_MINUTES must be >= 1, got {interval}")
+
+        window = int(_number(env, "ACTIVE_WINDOW_MINUTES", "15", int))
+        if window < 1:
+            # the per-folder session guard is a delete-safety feature;
+            # a zero/negative window would silently disable it
+            raise ConfigError(f"ACTIVE_WINDOW_MINUTES must be >= 1, got {window}")
 
         return cls(
             seestar_host=host,
             archive_dir=Path(env.get("ARCHIVE_DIR", "/archive")),
-            sync_interval_minutes=int(_number(env, "SYNC_INTERVAL_MINUTES", "15", int)),
+            sync_interval_minutes=interval,
             reclaim_trigger_percent=trigger,
             reclaim_target_percent=target,
-            active_window_minutes=int(_number(env, "ACTIVE_WINDOW_MINUTES", "15", int)),
+            active_window_minutes=window,
             device_capacity_gb=capacity,
-            kuma_push_url=env.get("KUMA_PUSH_URL") or None,
-            ha_webhook_url=env.get("HA_WEBHOOK_URL") or None,
+            kuma_push_url=_http_url(env, "KUMA_PUSH_URL"),
+            ha_webhook_url=_http_url(env, "HA_WEBHOOK_URL"),
             dry_run=_bool(env, "DRY_RUN"),
             archive_on_root_fs_ok=_bool(env, "ARCHIVE_ON_ROOT_FS_OK"),
             log_level=env.get("LOG_LEVEL", "INFO").upper(),
@@ -252,12 +315,12 @@ class Config:
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_config.py -v`
-Expected: 5 passed
+Expected: 10 passed
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add pyproject.toml uv.lock .gitignore src/ tests/
+git add pyproject.toml uv.lock .gitignore .python-version README.md src/ tests/
 git commit -m "feat: scaffold uv project with env-based Config"
 ```
 
@@ -2214,7 +2277,7 @@ def _prepare(config: Config, init: bool) -> Archive:
     return archive
 
 
-def _one_run(config: Config, archive: Archive, device_factory) -> int:
+def _one_run(config: Config, archive: Archive, device_factory, should_stop=None) -> int:
     from .device import DeviceUnavailable
 
     try:
@@ -2227,7 +2290,7 @@ def _one_run(config: Config, archive: Archive, device_factory) -> int:
         report_all(config, archive.meta_dir, summary)
         return 0
     with Manifest(archive.meta_dir / "manifest.db") as manifest:
-        summary = run_sync(device, archive, manifest, config)
+        summary = run_sync(device, archive, manifest, config, should_stop=should_stop)
     report_all(config, archive.meta_dir, summary)
     return 0 if summary.result in ("ok", "skipped_unreachable") else 1
 
@@ -2255,7 +2318,9 @@ def _cmd_daemon(config: Config, args, device_factory) -> int:
     log.info("daemon: syncing %s every %d min", config.seestar_host,
              config.sync_interval_minutes)
     while not stop.is_set():
-        code = _one_run(config, archive, device_factory)
+        # stop.is_set threads through run_sync as should_stop, so a signal
+        # mid-run ends the sync bounded by one file, not one full run
+        code = _one_run(config, archive, device_factory, should_stop=stop.is_set)
         if code != 0:
             log.warning("run finished with errors (exit %d); continuing", code)
         stop.wait(interval)  # interruptible, unlike time.sleep
