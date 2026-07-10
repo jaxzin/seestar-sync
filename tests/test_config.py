@@ -105,6 +105,7 @@ def test_mqtt_defaults_and_parse():
     assert cfg.mqtt_host == "homeassistant.local" and cfg.mqtt_port == 1884
     assert cfg.mqtt_username == "seestar" and cfg.mqtt_password == "hunter2"
     assert cfg.mqtt_topic_prefix == "scope2"
+    assert "hunter2" not in repr(cfg)
 
 
 def test_mqtt_validation_is_fatal():

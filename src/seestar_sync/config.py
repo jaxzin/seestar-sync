@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,7 +61,7 @@ class Config:
     mqtt_host: str | None
     mqtt_port: int
     mqtt_username: str | None
-    mqtt_password: str | None
+    mqtt_password: str | None = dataclasses.field(repr=False)  # never in tracebacks
     mqtt_topic_prefix: str
     dry_run: bool
     archive_on_root_fs_ok: bool
