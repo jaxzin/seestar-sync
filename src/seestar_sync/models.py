@@ -40,6 +40,7 @@ class RunSummary:
     started_at: str  # ISO 8601 UTC
     result: str  # ok | partial | skipped_unreachable | error
     dry_run: bool = False
+    reclaim_enabled: bool = False  # machine-readable copy-only signal
     files_copied: int = 0
     bytes_copied: int = 0
     files_deleted: int = 0
@@ -53,6 +54,7 @@ class RunSummary:
             "last_run": self.started_at,
             "result": self.result,
             "dry_run": self.dry_run,
+            "reclaim_enabled": self.reclaim_enabled,
             "files_copied": self.files_copied,
             "bytes_copied": self.bytes_copied,
             "files_deleted": self.files_deleted,
