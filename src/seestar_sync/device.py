@@ -17,6 +17,14 @@ class DeviceUnavailable(Exception):
     powering off is routine, not an error)."""
 
 
+class FreeSpaceUnavailable(Exception):
+    """Free space cannot be measured (firmware won't answer FsFullSizeInformation
+    and DEVICE_CAPACITY_GB is unset). The device is REACHABLE — this is a
+    configuration/firmware problem that permanently disables reclaim, so it
+    must surface as a run error (partial → Kuma silence → operator alerted),
+    never be mistaken for a routine device-off."""
+
+
 class DeviceClient(Protocol):
     def list_files(self) -> list[DeviceFile]:
         """Recursive listing of MyWorks/. Raises DeviceUnavailable."""
@@ -43,5 +51,6 @@ class DeviceClient(Protocol):
         ...
 
     def disk_usage(self) -> DiskUsage:
-        """Raises DeviceUnavailable."""
+        """Raises DeviceUnavailable (device gone) or FreeSpaceUnavailable
+        (device fine, measurement impossible)."""
         ...

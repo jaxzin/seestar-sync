@@ -56,3 +56,38 @@ def test_disk_usage_fallback_uses_capacity(monkeypatch):
     monkeypatch.setattr(c, "list_files", lambda: [DeviceFile("a/b.fit", 600, 0.0)])
     usage = c.disk_usage()
     assert usage.total_bytes == 1000 and usage.free_bytes == 400
+
+
+def test_disk_usage_without_capacity_raises_free_space_unavailable(monkeypatch):
+    # reachable device + unmeasurable space is NOT DeviceUnavailable — it
+    # must surface as an alertable error, not read as a routine power-off
+    from seestar_sync.device import FreeSpaceUnavailable
+
+    c = client()
+    c._host = "h"
+    c._capacity_bytes = None
+    monkeypatch.setattr(c, "_stat_volume", lambda: (_ for _ in ()).throw(OSError("no")))
+    with pytest.raises(FreeSpaceUnavailable, match="DEVICE_CAPACITY_GB"):
+        c.disk_usage()
+
+
+def test_open_read_wraps_mid_stream_failures(monkeypatch):
+    # the open is mapped; the READS must be too — a mid-transfer power-off
+    # must surface as DeviceUnavailable, never a raw ConnectionResetError
+    c = client()
+    c._host = "h"
+
+    class DyingRaw:
+        def read(self, n=-1):
+            raise ConnectionResetError("mid-read power-off")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "seestar_sync.smb_client.smbclient.open_file", lambda *a, **k: DyingRaw()
+    )
+    reader = c.open_read("M 81_sub/a.fit")
+    with pytest.raises(DeviceUnavailable):
+        reader.read()
+    reader.close()  # closing a dead handle must not raise

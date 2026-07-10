@@ -14,13 +14,44 @@ from typing import BinaryIO
 import smbclient
 from smbprotocol.exceptions import SMBException
 
-from .device import DeviceUnavailable
+from .device import DeviceUnavailable, FreeSpaceUnavailable
 from .models import DeviceFile, DiskUsage
 
 log = logging.getLogger(__name__)
 
 SHARE = "EMMC Images"
 ROOT = "MyWorks"
+
+
+class _MappedReader:
+    """File-like wrapper keeping mid-stream SMB failures inside the seam.
+
+    _map_errors protects the open; the reads happen later, inside
+    archive.write_stream — without this wrapper a telescope powering off
+    mid-transfer leaks a raw ConnectionResetError past DeviceClient and
+    kills the daemon.
+    """
+
+    def __init__(self, raw, map_errors):
+        self._raw = raw
+        self._map_errors = map_errors
+
+    def read(self, n: int = -1) -> bytes:
+        with self._map_errors():
+            return self._raw.read(n)
+
+    def close(self) -> None:
+        try:
+            self._raw.close()
+        except Exception:  # noqa: BLE001 — closing a dead handle is not an event
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
 
 class SmbDeviceClient:
@@ -85,7 +116,8 @@ class SmbDeviceClient:
 
     def open_read(self, path: str) -> BinaryIO:
         with self._map_errors():
-            return smbclient.open_file(self._unc(path), mode="rb")
+            raw = smbclient.open_file(self._unc(path), mode="rb")
+        return _MappedReader(raw, self._map_errors)
 
     def delete_file(self, path: str) -> None:
         with self._map_errors():
@@ -105,17 +137,21 @@ class SmbDeviceClient:
         return smbclient.stat_volume(self._unc())
 
     def disk_usage(self) -> DiskUsage:
-        """Primary: SMB2 FsFullSizeInformation via stat_volume (live-smoke
-        validated, spec Open item 1). Fallback: walk-derived usage against
-        DEVICE_CAPACITY_GB."""
+        """Primary: SMB2 FsFullSizeInformation via stat_volume (validated by
+        the live smoke ring, Task 13 — spec Open item 1). Fallback:
+        walk-derived usage against DEVICE_CAPACITY_GB."""
         try:
             v = self._stat_volume()
             return DiskUsage(total_bytes=v.total_size, free_bytes=v.actual_available_size)
         except (SMBException, OSError, NotImplementedError) as e:
             if self._capacity_bytes is None:
-                raise DeviceUnavailable(
+                # Distinct from DeviceUnavailable: the device is reachable,
+                # reclaim is blinded — must alert, not read as device-off.
+                raise FreeSpaceUnavailable(
                     f"stat_volume failed ({e}) and DEVICE_CAPACITY_GB is not set — "
-                    "cannot measure free space, refusing to reclaim blind"
+                    "cannot measure free space, refusing to reclaim blind. "
+                    "Set DEVICE_CAPACITY_GB (e.g. 128 for the S30 Pro) to enable "
+                    "the walk-based fallback."
                 ) from e
             log.warning("stat_volume failed (%s); using walk-based fallback", e)
             used = sum(f.size for f in self.list_files())
