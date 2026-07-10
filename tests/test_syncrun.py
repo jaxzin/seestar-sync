@@ -21,7 +21,9 @@ def env(tmp_path):
 
 
 def config(**overrides):
-    env_vars = {"SEESTAR_HOST": "h"}
+    # most tests exercise the reclaim engine, so enable it here; the opt-in
+    # default (reclaim_enabled=False) is pinned by its own dedicated test
+    env_vars = {"SEESTAR_HOST": "h", "RECLAIM_ENABLED": "true"}
     env_vars.update(overrides)
     return Config.from_env(env_vars)
 
@@ -190,6 +192,23 @@ def test_should_stop_bounds_shutdown_to_one_file(env):
     s = run_sync(d, archive, manifest, config(), now=1_000_000.0,
                  should_stop=lambda: next(calls, True))
     assert s.files_copied == 1  # stopped between files, not mid-file
+    assert s.result == "ok"
+
+
+def test_reclaim_disabled_by_default_is_copy_only(env):
+    # user-ratified: deletion is opt-in. A DEFAULT config under storage
+    # pressure with verified copies must still never delete anything.
+    archive, manifest = env
+    cfg = Config.from_env({"SEESTAR_HOST": "h"})
+    assert cfg.reclaim_enabled is False
+    d = FakeDevice(capacity=1000)
+    path = "M 81_sub/Light_a_20250101-000000.fit"
+    d.put(path, b"x" * 800, mtime=1.0)  # 80% used — past the trigger
+    s = run_sync(d, archive, manifest, cfg, now=1_000_000.0)
+    assert s.files_copied == 1  # copying proceeds normally
+    assert s.files_deleted == 0
+    assert len(d.list_files()) == 1  # nothing deleted
+    assert s.device_used_percent == 80.0  # fill level still reported
     assert s.result == "ok"
 
 

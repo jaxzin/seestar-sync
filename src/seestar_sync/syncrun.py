@@ -69,7 +69,15 @@ def run_sync(
     )
 
     if not device_gone and not should_stop():
-        _reclaim_phase(device, manifest, config, files, active, summary, now, should_stop)
+        if config.reclaim_enabled:
+            _reclaim_phase(
+                device, manifest, config, files, active, summary, now, should_stop
+            )
+        else:
+            # deletion is opt-in (user-ratified): copy-only mode still
+            # reports fill level best-effort so monitoring sees the device
+            _report_usage_only(device, summary)
+            log.info("reclaim disabled (RECLAIM_ENABLED=false): copy-only mode")
 
     if summary.errors:
         summary.result = "partial"
@@ -116,6 +124,14 @@ def _copy_phase(
         summary.bytes_copied += f.size
         log.info("copied %s (%d bytes)", f.path, f.size)
     return False
+
+
+def _report_usage_only(device, summary) -> None:
+    """Best-effort fill level for monitoring; never fails a copy-only run."""
+    try:
+        summary.device_used_percent = round(device.disk_usage().used_percent, 1)
+    except (DeviceUnavailable, FreeSpaceUnavailable) as e:
+        log.debug("fill level unavailable in copy-only mode: %s", e)
 
 
 def _reclaim_phase(
