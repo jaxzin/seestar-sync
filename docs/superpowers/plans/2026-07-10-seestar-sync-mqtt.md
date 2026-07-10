@@ -271,6 +271,18 @@ def test_observer_mid_run_disconnect_still_emits_done(env):
     assert obs.events[-1].files_done == 1  # done carries banked totals
 
 
+def test_observer_idle_pass_emits_only_listing_and_done(env):
+    # the most common production pass (nothing new, every 15 min) must not
+    # blip HA's state topic through "copying"
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000)
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * 10, mtime=1.0)
+    run_sync(d, archive, manifest, config(), now=1_000_000.0)  # syncs everything
+    obs = RecordingObserver()
+    run_sync(d, archive, manifest, config(), now=1_000_100.0, observer=obs)
+    assert obs.phases() == ["listing", "done"]
+
+
 def test_observer_dry_run_emits_planned_counts(env):
     archive, manifest = env
     d = FakeDevice(capacity=100_000)
@@ -370,7 +382,7 @@ and after each `summary.files_deleted += 1; summary.bytes_reclaimed += d.file.si
 - [ ] **Step 5: Run tests**
 
 Run: `uv run pytest tests/test_syncrun.py -v`
-Expected: 21 passed. Full suite: all green.
+Expected: 22 passed. Full suite: all green.
 
 - [ ] **Step 6: Commit**
 
@@ -441,6 +453,8 @@ def test_corrupt_file_falls_back_to_empty(tmp_path):
     assert SettingsStore(p).load() == {}
     p.write_text(json.dumps({"reclaim_enabled": {"value": "banana", "modified_at": "t"}}))
     assert SettingsStore(p).load() == {}  # wrong type inside is dropped too
+    p.write_text(json.dumps({"seestar_host": {"value": "evil host", "modified_at": "t"}}))
+    assert SettingsStore(p).load() == {}  # whitespace host dropped at LOAD too
 
 
 def test_resolve_effective_precedence_and_sources(tmp_path):
