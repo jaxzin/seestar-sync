@@ -340,6 +340,18 @@ def test_observer_mid_run_disconnect_still_emits_done(env):
     assert obs.events[-1].files_done == 1  # done carries banked totals
 
 
+def test_observer_idle_pass_emits_only_listing_and_done(env):
+    # the most common production pass (nothing new, every 15 min) must not
+    # blip HA's state topic through "copying"
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000)
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * 10, mtime=1.0)
+    run_sync(d, archive, manifest, config(), now=1_000_000.0)  # syncs everything
+    obs = RecordingObserver()
+    run_sync(d, archive, manifest, config(), now=1_000_100.0, observer=obs)
+    assert obs.phases() == ["listing", "done"]
+
+
 def test_observer_dry_run_emits_planned_counts(env):
     archive, manifest = env
     d = FakeDevice(capacity=100_000)
