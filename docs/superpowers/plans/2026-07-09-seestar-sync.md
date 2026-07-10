@@ -1392,6 +1392,24 @@ def test_tier_order_subs_then_videos_then_stacked():
     assert [d.tier for d in plan] == [Tier.SUBS, Tier.VIDEOS, Tier.STACKED_FITS]
 
 
+def test_hysteresis_spills_across_tiers_and_stops_at_target():
+    # SDET-required boundary case: tier 1 exhausts mid-loop, reclaim spills
+    # into tier 2, and stops at target WITHOUT touching tier 3
+    usage = DiskUsage(total_bytes=1000, free_bytes=100)  # 90% used; target 60 → free 300
+    subs = [sub(f"Light_a_2025010{i}-000000.fit", 100, mtime=float(i)) for i in (1, 2)]
+    videos = [
+        DeviceFile("Sun/clip_20250101-000000.avi", 100, 1.0),
+        DeviceFile("Sun/clip_20250102-000000.avi", 100, 1.0),
+    ]
+    stacked = DeviceFile("M 81/DSO_Stacked_1_M 81_10.0s_20200101_000000.fit", 100, 1.0)
+    plan = plan_reclaim(
+        [*videos, stacked, *subs], usage, 75, 60,
+        is_verified=lambda f: True, active=set(),
+    )
+    assert [d.tier for d in plan] == [Tier.SUBS, Tier.SUBS, Tier.VIDEOS]
+    assert sum(d.file.size for d in plan) == 300  # stops at target, no over-delete
+
+
 def test_unverified_active_and_non_candidates_are_untouchable():
     usage = DiskUsage(total_bytes=100, free_bytes=0)
     jpg = DeviceFile("M 81/DSO_Stacked_1_M 81_10.0s_20200101_000000.jpg", 50, 1.0)
@@ -1476,7 +1494,7 @@ def plan_reclaim(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_reclaim.py -v`
-Expected: 4 passed
+Expected: 5 passed
 
 - [ ] **Step 5: Commit**
 
