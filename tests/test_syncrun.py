@@ -1,5 +1,6 @@
 import pytest
 
+from seestar_sync import syncrun
 from seestar_sync.archive import Archive
 from seestar_sync.config import Config
 from seestar_sync.device import DeviceUnavailable
@@ -293,6 +294,41 @@ def test_observer_sequence_for_copy_pass(env):
     assert copying[0].files_done == 0  # the plan-known announcement
     assert copying[-1].files_done == 2 and copying[-1].bytes_done == 30
     assert copying[1].current_path == "A_sub/Light_a_20250101-000000.fit"
+
+
+def test_intrafile_progress_emits_growing_bytes_done(env, monkeypatch):
+    # a single large file must produce multiple mid-file progress events with a
+    # monotonically climbing bytes_done, not one jump at end-of-file. Shrink the
+    # coalesce threshold so the test needn't allocate 64 MiB+.
+    monkeypatch.setattr(syncrun, "_PROGRESS_COALESCE_BYTES", 2 * 1024 * 1024)
+    size = 9 * 1024 * 1024  # 9 chunks; crosses the 2 MiB threshold several times
+    archive, manifest = env
+    d = FakeDevice(capacity=10_000_000_000)  # roomy: no reclaim pressure
+    d.put("Solar_video/big.avi", b"z" * size, mtime=1.0)
+    obs = RecordingObserver()
+    run_sync(d, archive, manifest, config(), now=1_000_000.0, observer=obs)
+
+    copying = [e for e in obs.events
+               if e.phase == "copying" and e.current_path == "Solar_video/big.avi"]
+    mid = [e for e in copying if e.bytes_done < size]  # strictly-partial emits
+    assert len(mid) >= 3, f"expected multiple intra-file emits, got {len(mid)}"
+    seq = [e.bytes_done for e in copying]
+    assert seq == sorted(seq)  # monotonic non-decreasing across the whole copy
+    # files_done stays 0 until the file completes; the final copying event is the
+    # post-copy one (bytes fully banked, file counted)
+    assert all(e.files_done == 0 for e in mid)
+    assert copying[-1].bytes_done == size and copying[-1].files_done == 1
+
+
+def test_copy_logs_start_and_completion_lines(env, caplog):
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000)
+    d.put("Solar_video/big.avi", b"z" * (5 * 1024 * 1024), mtime=1.0)
+    with caplog.at_level("INFO"):
+        run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("copying Solar_video/big.avi (" in m for m in msgs)  # start line
+    assert any("copied Solar_video/big.avi (" in m for m in msgs)  # completion line
 
 
 def test_observer_sequence_for_reclaim_and_done_totals(env):

@@ -12,7 +12,8 @@ def make_archive(tmp_path, dev_of=None):
     root.mkdir()
     if dev_of is None:
         # root tree on device 2, "/" on device 1 -> foreign storage, checks pass
-        dev_of = lambda p: 2 if str(p).startswith(str(root)) else 1
+        def dev_of(p):
+            return 2 if str(p).startswith(str(root)) else 1
     return Archive(root, dev_of=dev_of)
 
 

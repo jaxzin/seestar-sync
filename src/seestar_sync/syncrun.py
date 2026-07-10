@@ -29,6 +29,14 @@ log = logging.getLogger(__name__)
 
 MAX_VERIFY_FAILURES = 3
 
+# Emit at most one intra-file progress event per this many bytes written, so a
+# ~29 GB video produces hundreds of events, not tens of thousands. The MQTT
+# consumer still throttles by wall-clock; this bounds event volume at the source.
+_PROGRESS_COALESCE_BYTES = 64 * 1024 * 1024
+# Operator-visible heartbeat cadence for an in-flight copy (seconds). Sits just
+# above the MqttReporter's 10 s throttle so the two do not oscillate.
+_COPY_HEARTBEAT_SECONDS = 15.0
+
 
 def iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -134,9 +142,27 @@ def _copy_phase(
                                  files_total=files_total, bytes_done=bytes_done,
                                  bytes_total=bytes_total, current_path=f.path))
             continue
+        log.info("copying %s (%d bytes)", f.path, f.size)
+        base = bytes_done  # bytes from files already completed this pass
+        emit_state = {"last": base, "hb": time.monotonic()}
+
+        def _tick(written: int, _f=f) -> None:
+            cum = base + written
+            if cum - emit_state["last"] >= _PROGRESS_COALESCE_BYTES:
+                emit_state["last"] = cum
+                notify(ProgressEvent(
+                    phase="copying", files_done=files_done, files_total=files_total,
+                    bytes_done=cum, bytes_total=bytes_total, current_path=_f.path))
+            t = time.monotonic()
+            if written < _f.size and t - emit_state["hb"] >= _COPY_HEARTBEAT_SECONDS:
+                emit_state["hb"] = t
+                pct = int(100 * written / _f.size) if _f.size else 100
+                log.info("copying %s: %.1f/%.1f GB (%d%%)", _f.path,
+                         written / 1e9, _f.size / 1e9, pct)
+
         try:
             with device.open_read(f.path) as reader:
-                sha = archive.write_stream(f.path, reader, f.size, f.mtime)
+                sha = archive.write_stream(f.path, reader, f.size, f.mtime, on_bytes=_tick)
         except FileNotFoundError:
             log.debug("%s vanished before copy (app-side removal); normal drift", f.path)
             continue
