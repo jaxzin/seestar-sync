@@ -19,7 +19,7 @@ def test_minimal_env_uses_defaults():
     assert cfg.active_window_minutes == 15
     assert cfg.device_capacity_gb is None
     assert cfg.kuma_push_url is None
-    assert cfg.ha_webhook_url is None
+    assert cfg.mqtt_host is None
     assert cfg.dry_run is False
     assert cfg.archive_on_root_fs_ok is False
     assert cfg.log_level == "INFO"
@@ -60,11 +60,11 @@ def test_non_positive_capacity_and_window_are_fatal():
         Config.from_env(base_env(ACTIVE_WINDOW_MINUTES="0"))
 
 
-def test_webhook_urls_must_be_http():
+def test_kuma_url_must_be_http():
     with pytest.raises(ConfigError, match="KUMA_PUSH_URL"):
         Config.from_env(base_env(KUMA_PUSH_URL="file:///etc/passwd"))
-    cfg = Config.from_env(base_env(HA_WEBHOOK_URL="https://ha.local/api/webhook/x"))
-    assert cfg.ha_webhook_url == "https://ha.local/api/webhook/x"
+    cfg = Config.from_env(base_env(KUMA_PUSH_URL="https://kuma.local/api/push/x"))
+    assert cfg.kuma_push_url == "https://kuma.local/api/push/x"
 
 
 def test_reclaim_is_opt_in():
@@ -90,3 +90,33 @@ def test_non_positive_interval_is_fatal():
     for raw in ("0", "-5"):
         with pytest.raises(ConfigError, match="SYNC_INTERVAL_MINUTES"):
             Config.from_env(base_env(SYNC_INTERVAL_MINUTES=raw))
+
+
+def test_mqtt_defaults_and_parse():
+    cfg = Config.from_env(base_env())
+    assert cfg.mqtt_host is None and cfg.mqtt_port == 1883
+    assert cfg.mqtt_username is None and cfg.mqtt_password is None
+    assert cfg.mqtt_topic_prefix == "seestar-sync"
+    cfg = Config.from_env(base_env(
+        MQTT_HOST="homeassistant.local", MQTT_PORT="1884",
+        MQTT_USERNAME="seestar", MQTT_PASSWORD="hunter2",
+        MQTT_TOPIC_PREFIX="scope2",
+    ))
+    assert cfg.mqtt_host == "homeassistant.local" and cfg.mqtt_port == 1884
+    assert cfg.mqtt_username == "seestar" and cfg.mqtt_password == "hunter2"
+    assert cfg.mqtt_topic_prefix == "scope2"
+
+
+def test_mqtt_validation_is_fatal():
+    with pytest.raises(ConfigError, match="MQTT_PORT"):
+        Config.from_env(base_env(MQTT_HOST="h", MQTT_PORT="70000"))
+    with pytest.raises(ConfigError, match="MQTT_HOST"):
+        Config.from_env(base_env(MQTT_USERNAME="u"))  # auth without host
+    with pytest.raises(ConfigError, match="MQTT_USERNAME"):
+        Config.from_env(base_env(MQTT_HOST="h", MQTT_PASSWORD="p"))
+    with pytest.raises(ConfigError, match="MQTT_TOPIC_PREFIX"):
+        Config.from_env(base_env(MQTT_HOST="h", MQTT_TOPIC_PREFIX="a/b"))
+
+
+def test_ha_webhook_url_is_gone():
+    assert not hasattr(Config.from_env(base_env()), "ha_webhook_url")

@@ -59,21 +59,8 @@ def ping_kuma(url: str, summary: RunSummary) -> None:
         pass
 
 
-def post_ha_webhook(url: str, summary: RunSummary) -> None:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(summary.to_json()).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT):
-        pass
-
-
 def report_all(config: Config, meta_dir: Path, summary: RunSummary) -> None:
     _guard("status", write_status, meta_dir, summary)
     _guard("history", append_history, meta_dir, summary)
     if config.kuma_push_url:
         _guard("kuma", ping_kuma, config.kuma_push_url, summary)
-    if config.ha_webhook_url:
-        _guard("ha", post_ha_webhook, config.ha_webhook_url, summary)

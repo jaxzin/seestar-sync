@@ -36,7 +36,7 @@ def _number(env: Mapping[str, str], key: str, default: str, cast) -> float | int
 
 
 def _http_url(env: Mapping[str, str], key: str) -> str | None:
-    """Outbound reporter URLs (Kuma push, HA webhook) must be http(s):
+    """Outbound reporter URLs (Kuma push) must be http(s):
     urllib would happily open file:// etc."""
     url = env.get(key, "").strip()
     if not url:
@@ -57,7 +57,11 @@ class Config:
     active_window_minutes: int
     device_capacity_gb: float | None
     kuma_push_url: str | None
-    ha_webhook_url: str | None
+    mqtt_host: str | None
+    mqtt_port: int
+    mqtt_username: str | None
+    mqtt_password: str | None
+    mqtt_topic_prefix: str
     dry_run: bool
     archive_on_root_fs_ok: bool
     log_level: str
@@ -102,6 +106,23 @@ class Config:
                 f"LOG_LEVEL must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL, got {log_level!r}"
             )
 
+        mqtt_host = env.get("MQTT_HOST", "").strip() or None
+        mqtt_port = int(_number(env, "MQTT_PORT", "1883", int))
+        if not (1 <= mqtt_port <= 65535):
+            raise ConfigError(f"MQTT_PORT must be 1-65535, got {mqtt_port}")
+        mqtt_username = env.get("MQTT_USERNAME", "").strip() or None
+        mqtt_password = env.get("MQTT_PASSWORD", "") or None
+        if (mqtt_username or mqtt_password) and not mqtt_host:
+            raise ConfigError("MQTT_USERNAME/MQTT_PASSWORD set but MQTT_HOST is not")
+        if mqtt_password and not mqtt_username:
+            raise ConfigError("MQTT_PASSWORD set without MQTT_USERNAME")
+        mqtt_topic_prefix = env.get("MQTT_TOPIC_PREFIX", "seestar-sync").strip()
+        if not mqtt_topic_prefix or any(c in mqtt_topic_prefix for c in "/#+"):
+            raise ConfigError(
+                "MQTT_TOPIC_PREFIX must be a single topic segment "
+                f"(no / # +), got {mqtt_topic_prefix!r}"
+            )
+
         return cls(
             seestar_host=host,
             archive_dir=Path(env.get("ARCHIVE_DIR", "/archive")),
@@ -113,7 +134,12 @@ class Config:
             active_window_minutes=window,
             device_capacity_gb=capacity,
             kuma_push_url=_http_url(env, "KUMA_PUSH_URL"),
-            ha_webhook_url=_http_url(env, "HA_WEBHOOK_URL"),
+            # (HA webhook removed in v0.2 — MQTT replaces it; Kuma stays)
+            mqtt_host=mqtt_host,
+            mqtt_port=mqtt_port,
+            mqtt_username=mqtt_username,
+            mqtt_password=mqtt_password,
+            mqtt_topic_prefix=mqtt_topic_prefix,
             dry_run=_bool(env, "DRY_RUN"),
             archive_on_root_fs_ok=_bool(env, "ARCHIVE_ON_ROOT_FS_OK"),
             log_level=log_level,

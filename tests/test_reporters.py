@@ -82,9 +82,14 @@ def test_reporters_never_raise(tmp_path, monkeypatch):
         {
             "SEESTAR_HOST": "h",
             "KUMA_PUSH_URL": "http://127.0.0.1:1/push/x",  # nothing listens
-            "HA_WEBHOOK_URL": "http://127.0.0.1:1/api/webhook/x",
         }
     )
     report_all(cfg, Path("/nonexistent/definitely/not/writable"), summary())
     report_all(cfg, tmp_path, summary())  # endpoints down, files still written
     assert (tmp_path / "status.json").exists()
+
+
+def test_ha_webhook_reporter_is_gone():
+    import seestar_sync.reporters as reporters
+
+    assert not hasattr(reporters, "post_ha_webhook")
