@@ -77,6 +77,7 @@ def run_sync(
     )
 
     notify(ProgressEvent(phase="listing"))
+    listing_started = time.monotonic()
     try:
         files = device.list_files()
     except DeviceUnavailable as e:
@@ -84,6 +85,7 @@ def run_sync(
         summary.result = "skipped_unreachable"
         notify(ProgressEvent(phase="done"))
         return summary
+    log.info("listed %d files in %.1fs", len(files), time.monotonic() - listing_started)
 
     active = active_folders(files, now=now, window_minutes=config.active_window_minutes)
     summary.active_folders_skipped = sorted(active)

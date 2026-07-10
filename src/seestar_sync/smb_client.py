@@ -55,6 +55,10 @@ class _MappedReader:
 
 
 class SmbDeviceClient:
+    # Flips true the first time _entry_meta falls back to per-file stat(), so a
+    # future smbprotocol that drops _dir_info degrades loudly, not silently-slow.
+    _warned_slow_stat = False
+
     def __init__(self, host: str, capacity_gb: float | None = None, timeout: float = 30.0):
         self._host = host
         self._capacity_bytes = (
@@ -121,8 +125,33 @@ class SmbDeviceClient:
             if entry.is_dir():
                 self._scan(f"{unc}\\{entry.name}", f"{rel}/", out)
             else:
-                st = entry.stat()  # cached from the directory listing
-                out.append(DeviceFile(rel, st.st_size, st.st_mtime))
+                size, mtime = self._entry_meta(entry)
+                out.append(DeviceFile(rel, size, mtime))
+
+    def _entry_meta(self, entry) -> tuple[int, float]:
+        """Size + mtime from the directory enumeration, NOT entry.stat().
+
+        smbprotocol's SMBDirEntry.stat() costs an extra SMB round-trip per file
+        (its own docstring: "always requires an extra SMB call or 2"), which
+        turned a ~9-second walk into 6-7 minutes over WiFi for ~6k files. The
+        scandir enumeration already carries end_of_file (size) and
+        last_write_time (a tz-aware datetime); reading them is byte-identical to
+        stat() — validated to the microsecond on the real S30 Pro (2026-07-10).
+        Fall back to stat() only if a future smbprotocol drops the private
+        _dir_info attribute: correct, just slow, and warned once.
+        """
+        di = getattr(entry, "_dir_info", None)
+        if di is not None:
+            return di.end_of_file, di.last_write_time.timestamp()
+        if not self._warned_slow_stat:
+            type(self)._warned_slow_stat = True
+            log.warning(
+                "smbprotocol SMBDirEntry._dir_info unavailable; falling back to "
+                "per-file stat() — device listing will be much slower. "
+                "Check the smbprotocol version."
+            )
+        st = entry.stat()
+        return st.st_size, st.st_mtime
 
     def stat(self, path: str) -> DeviceFile:
         unc = self._unc(path)

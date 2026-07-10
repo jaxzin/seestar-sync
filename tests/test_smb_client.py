@@ -1,3 +1,5 @@
+import datetime
+
 import pytest
 
 from seestar_sync.device import DeviceUnavailable
@@ -6,6 +8,47 @@ from seestar_sync.smb_client import SmbDeviceClient
 
 def client():
     return SmbDeviceClient.__new__(SmbDeviceClient)  # skip __init__ (no network)
+
+
+class _FakeDirInfo:
+    """Mimics smbprotocol's SMBDirEntryInformation (size + tz-aware mtime)."""
+
+    def __init__(self, size: int, mtime_epoch: float):
+        self.end_of_file = size
+        self.last_write_time = datetime.datetime.fromtimestamp(
+            mtime_epoch, tz=datetime.timezone.utc
+        )
+
+
+class _FakeStat:
+    def __init__(self, size: int, mtime_epoch: float):
+        self.st_size = size
+        self.st_mtime = mtime_epoch
+
+
+class _FakeEntry:
+    """Mimics smbprotocol's SMBDirEntry. Tracks stat() calls so a test can prove
+    the fast path never triggers a per-file SMB round-trip."""
+
+    def __init__(self, name, is_dir, dir_info=None, stat_result=None):
+        self.name = name
+        self._is_dir = is_dir
+        if dir_info is not None:
+            self._dir_info = dir_info  # absent entirely when None (fallback case)
+        self._stat_result = stat_result
+        self.stat_calls = 0
+
+    def is_dir(self):
+        return self._is_dir
+
+    def stat(self):
+        self.stat_calls += 1
+        return self._stat_result
+
+
+def _fake_scandir(mapping):
+    """Return a scandir(unc) that yields the entries mapped to each UNC."""
+    return lambda unc: iter(mapping.get(unc, []))
 
 
 def test_unc_path_building():
@@ -84,6 +127,60 @@ def test_disk_usage_without_capacity_raises_free_space_unavailable(monkeypatch):
     monkeypatch.setattr(c, "_stat_volume", lambda: (_ for _ in ()).throw(OSError("no")))
     with pytest.raises(FreeSpaceUnavailable, match="DEVICE_CAPACITY_GB"):
         c.disk_usage()
+
+
+def test_scan_reads_metadata_from_enumeration_not_stat(monkeypatch):
+    # the perf fix: size+mtime come from the directory enumeration, so no
+    # per-file stat() round-trip happens (that was the ~7-minute walk)
+    from seestar_sync.models import DeviceFile
+
+    c = client()
+    c._host = "h"
+    entry = _FakeEntry("a.fit", is_dir=False, dir_info=_FakeDirInfo(1234, 1782590487.22))
+    monkeypatch.setattr(
+        "seestar_sync.smb_client.smbclient.scandir",
+        _fake_scandir({c._unc(): [entry]}),
+    )
+    out: list[DeviceFile] = []
+    c._scan(c._unc(), "", out)
+    assert len(out) == 1
+    assert out[0].path == "a.fit" and out[0].size == 1234
+    assert abs(out[0].mtime - 1782590487.22) < 1e-6
+    assert entry.stat_calls == 0  # the whole point: zero per-file round-trips
+
+
+def test_scan_falls_back_to_stat_when_dir_info_absent(monkeypatch):
+    # defensive: a future smbprotocol without _dir_info stays correct via stat()
+    c = client()
+    c._host = "h"
+    SmbDeviceClient._warned_slow_stat = False  # reset the process-wide warn-once
+    entry = _FakeEntry("b.fit", is_dir=False, dir_info=None,
+                       stat_result=_FakeStat(999, 42.0))
+    monkeypatch.setattr(
+        "seestar_sync.smb_client.smbclient.scandir",
+        _fake_scandir({c._unc(): [entry]}),
+    )
+    out = []
+    c._scan(c._unc(), "", out)
+    assert out[0].size == 999 and out[0].mtime == 42.0
+    assert entry.stat_calls == 1  # fallback used the (slow) stat() path
+
+
+def test_scan_recurses_and_builds_relative_paths(monkeypatch):
+    c = client()
+    c._host = "h"
+    sub = _FakeEntry("M 81_sub", is_dir=True)
+    leaf = _FakeEntry("Light_a.fit", is_dir=False, dir_info=_FakeDirInfo(10, 100.0))
+    monkeypatch.setattr(
+        "seestar_sync.smb_client.smbclient.scandir",
+        _fake_scandir({
+            c._unc(): [sub],
+            c._unc() + "\\M 81_sub": [leaf],
+        }),
+    )
+    out = []
+    c._scan(c._unc(), "", out)
+    assert [f.path for f in out] == ["M 81_sub/Light_a.fit"]
 
 
 def test_open_read_wraps_mid_stream_failures(monkeypatch):
