@@ -622,6 +622,7 @@ class FakeClient:
     def __init__(self):
         self.published = []  # (topic, payload, retain)
         self.subscribed = []
+        self.calls = []  # ordered call log for sequencing assertions
         self.will = None
         self.connected = False
         self.on_connect = None
@@ -643,17 +644,22 @@ class FakeClient:
 
     def loop_stop(self):
         self.connected = False
+        self.calls.append("loop_stop")
 
     def disconnect(self):
-        pass
+        self.calls.append("disconnect")
 
     class _MsgInfo:
+        def __init__(self, owner):
+            self._owner = owner
+
         def wait_for_publish(self, timeout=None):
-            pass
+            self._owner.calls.append("wait_for_publish")
 
     def publish(self, topic, payload=None, qos=0, retain=False):
         self.published.append((topic, payload, retain))
-        return self._MsgInfo()
+        self.calls.append(f"publish:{topic}")
+        return self._MsgInfo(self)
 
     def subscribe(self, topic, qos=0):
         self.subscribed.append(topic)
@@ -819,13 +825,20 @@ def test_invalid_host_command_rejected_and_reechoed(tmp_path):
     assert ("seestar-sync/settings/seestar_host", "seestar.local", True) in fake.published
 
 
-def test_stop_publishes_offline_retained(tmp_path):
-    # LWT only fires on UNGRACEFUL death; clean shutdown must publish offline
+def test_stop_publishes_offline_retained_before_disconnect(tmp_path):
+    # LWT only fires on UNGRACEFUL death, and a clean DISCONNECT suppresses
+    # it — so the ORDER is the contract: flush offline to the wire, THEN
+    # disconnect, THEN stop the loop. A reorder must go red here.
     rep, fake, *_ = make(tmp_path)
     rep.start()
     fake.published.clear()
+    fake.calls.clear()
     rep.stop()
     assert ("seestar-sync/availability", "offline", True) in fake.published
+    off = fake.calls.index("publish:seestar-sync/availability")
+    assert off < fake.calls.index("wait_for_publish")
+    assert fake.calls.index("wait_for_publish") < fake.calls.index("disconnect")
+    assert fake.calls.index("disconnect") < fake.calls.index("loop_stop")
 
 
 def test_publish_summary_retains_and_never_raises(tmp_path):
