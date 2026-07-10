@@ -24,6 +24,15 @@ def test_tier_allowlist():
     assert classify_tier("M 81/Stacked_119_M 81_10.0s_20250607_221746.fit") == Tier.STACKED_FITS
 
 
+def test_video_in_target_folder_is_tier2():
+    # Conscious deviation from spec's "solar-system folders" (architect-ratified):
+    # an extension allowlist avoids brittle folder-name coupling. Pin it so
+    # nobody "fixes" it backwards.
+    assert classify_tier("M 81/mosaic.mp4") == Tier.VIDEOS
+    assert classify_tier("M 81_sub/clip.avi") is None  # _sub still admits only .fit
+    assert DiskUsage(total_bytes=0, free_bytes=0).used_percent == 0.0  # fail-safe
+
+
 def test_non_candidates_are_never_deletable():
     # JPGs and thumbnails: structurally unreachable
     assert classify_tier("M 81/DSO_Stacked_33_M 81_20.0s_20260311_213509.jpg") is None

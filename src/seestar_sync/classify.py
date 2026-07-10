@@ -23,7 +23,12 @@ def top_folder(path: str) -> str:
 
 
 def classify_tier(path: str) -> Tier | None:
-    """Allowlist classifier. None means the deleter can never touch this file."""
+    """Allowlist classifier. None means the deleter can never touch this file.
+
+    Tier 2 (videos) applies in any non-_sub folder — deliberately broader than
+    the spec's "solar-system folders": an extension allowlist avoids brittle
+    folder-name coupling, and deletion still requires a verified NAS copy.
+    """
     name = path.rsplit("/", 1)[-1]
     suffix = PurePosixPath(name).suffix.lower()
     if top_folder(path).endswith("_sub"):
