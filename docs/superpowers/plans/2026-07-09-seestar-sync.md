@@ -1527,7 +1527,7 @@ git commit -m "feat: fire-and-forget reporters (status, JSONL history, Kuma, HA)
 - Test: `tests/test_syncrun.py`
 
 **Interfaces:**
-- Produces: `run_sync(device: DeviceClient, archive: Archive, manifest: Manifest, config: Config, now: float | None = None) -> RunSummary`; helper `iso(ts: float) -> str`; module constant `MAX_VERIFY_FAILURES = 3`.
+- Produces: `run_sync(device: DeviceClient, archive: Archive, manifest: Manifest, config: Config, now: float | None = None, should_stop: Callable[[], bool] | None = None) -> RunSummary`; helper `iso(ts: float) -> str`; module constant `MAX_VERIFY_FAILURES = 3`. `should_stop` is polled between files (copy phase) and between deletions (reclaim phase) so a shutdown signal ends the run bounded by one file, not one full sync.
 - Consumes: everything from Tasks 2–8 with the exact signatures defined there.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1642,6 +1642,18 @@ def test_verify_failure_counts_and_eventually_skips(env):
     assert manifest.failure_count(path) == 3
 
 
+def test_should_stop_bounds_shutdown_to_one_file(env):
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000)
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * 10, mtime=1.0)
+    d.put("B_sub/Light_b_20250102-000000.fit", b"b" * 10, mtime=1.0)
+    calls = iter([False, True])  # allow first file, then signal shutdown
+    s = run_sync(d, archive, manifest, config(), now=1_000_000.0,
+                 should_stop=lambda: next(calls, True))
+    assert s.files_copied == 1  # stopped between files, not mid-file
+    assert s.result == "ok"
+
+
 def test_dry_run_touches_nothing(env):
     archive, manifest = env
     d = FakeDevice(capacity=1000)
@@ -1702,8 +1714,10 @@ def run_sync(
     manifest: Manifest,
     config: Config,
     now: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> RunSummary:
     now = time.time() if now is None else now
+    should_stop = should_stop or (lambda: False)
     summary = RunSummary(started_at=iso(now), result="ok", dry_run=config.dry_run)
 
     try:
@@ -1718,20 +1732,27 @@ def run_sync(
     if active:
         log.info("session guard: skipping active folders %s", sorted(active))
 
-    device_gone = _copy_phase(device, archive, manifest, config, files, active, summary, now)
+    device_gone = _copy_phase(
+        device, archive, manifest, config, files, active, summary, now, should_stop
+    )
 
-    if not device_gone:
-        _reclaim_phase(device, manifest, config, files, active, summary, now)
+    if not device_gone and not should_stop():
+        _reclaim_phase(device, manifest, config, files, active, summary, now, should_stop)
 
     if summary.errors:
         summary.result = "partial"
     return summary
 
 
-def _copy_phase(device, archive, manifest, config, files, active, summary, now) -> bool:
+def _copy_phase(
+    device, archive, manifest, config, files, active, summary, now, should_stop
+) -> bool:
     """Returns True if the device vanished mid-phase."""
     is_synced = lambda f: manifest.verified_ok(f.path, f.size, f.mtime)  # noqa: E731
     for f in plan_copies(files, is_synced, active):
+        if should_stop():
+            log.info("shutdown requested; stopping copy phase between files")
+            break
         if manifest.failure_count(f.path) >= MAX_VERIFY_FAILURES:
             summary.errors.append(
                 f"{f.path}: {MAX_VERIFY_FAILURES} consecutive verify failures, skipping"
@@ -1763,7 +1784,9 @@ def _copy_phase(device, archive, manifest, config, files, active, summary, now) 
     return False
 
 
-def _reclaim_phase(device, manifest, config, files, active, summary, now) -> None:
+def _reclaim_phase(
+    device, manifest, config, files, active, summary, now, should_stop
+) -> None:
     try:
         usage = device.disk_usage()
         summary.device_used_percent = round(usage.used_percent, 1)
@@ -1777,6 +1800,9 @@ def _reclaim_phase(device, manifest, config, files, active, summary, now) -> Non
         )
         emptied_sub_folders: set[str] = set()
         for d in plan:
+            if should_stop():
+                log.info("shutdown requested; stopping reclaim between deletions")
+                break
             if config.dry_run:
                 log.info("DRY_RUN would delete [tier %d] %s (%d bytes)",
                          d.tier, d.file.path, d.file.size)
