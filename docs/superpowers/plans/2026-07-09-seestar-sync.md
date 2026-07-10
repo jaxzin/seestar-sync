@@ -179,6 +179,12 @@ def test_webhook_urls_must_be_http():
     assert cfg.ha_webhook_url == "https://ha.local/api/webhook/x"
 
 
+def test_bad_log_level_is_fatal():
+    with pytest.raises(ConfigError, match="LOG_LEVEL"):
+        Config.from_env(base_env(LOG_LEVEL="banana"))
+    assert Config.from_env(base_env(LOG_LEVEL="debug")).log_level == "DEBUG"
+
+
 def test_garbage_bool_is_fatal():
     for raw in ("0", "no", "off"):
         assert Config.from_env(base_env(DRY_RUN=raw)).dry_run is False
@@ -321,7 +327,7 @@ class Config:
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_config.py -v`
-Expected: 10 passed
+Expected: 11 passed
 
 - [ ] **Step 6: Commit**
 
@@ -375,6 +381,15 @@ def test_tier_allowlist():
     # Tier 3: stacked FITs in target folders (both firmware naming generations)
     assert classify_tier("M 81/DSO_Stacked_33_M 81_20.0s_20260311_213509.fit") == Tier.STACKED_FITS
     assert classify_tier("M 81/Stacked_119_M 81_10.0s_20250607_221746.fit") == Tier.STACKED_FITS
+
+
+def test_video_in_target_folder_is_tier2():
+    # Conscious deviation from spec's "solar-system folders" (architect-ratified):
+    # an extension allowlist avoids brittle folder-name coupling. Pin it so
+    # nobody "fixes" it backwards.
+    assert classify_tier("M 81/mosaic.mp4") == Tier.VIDEOS
+    assert classify_tier("M 81_sub/clip.avi") is None  # _sub still admits only .fit
+    assert DiskUsage(total_bytes=0, free_bytes=0).used_percent == 0.0  # fail-safe
 
 
 def test_non_candidates_are_never_deletable():
@@ -521,7 +536,12 @@ def top_folder(path: str) -> str:
 
 
 def classify_tier(path: str) -> Tier | None:
-    """Allowlist classifier. None means the deleter can never touch this file."""
+    """Allowlist classifier. None means the deleter can never touch this file.
+
+    Tier 2 (videos) applies in any non-_sub folder — deliberately broader than
+    the spec's "solar-system folders": an extension allowlist avoids brittle
+    folder-name coupling, and deletion still requires a verified NAS copy.
+    """
     name = path.rsplit("/", 1)[-1]
     suffix = PurePosixPath(name).suffix.lower()
     if top_folder(path).endswith("_sub"):
@@ -566,7 +586,7 @@ def active_folders(files: Iterable[DeviceFile], now: float, window_minutes: int)
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_classify.py -v`
-Expected: 7 passed
+Expected: 8 passed
 
 - [ ] **Step 6: Commit**
 
@@ -591,6 +611,8 @@ git commit -m "feat: core models and allowlist tier classification"
 `tests/test_manifest.py`:
 
 ```python
+import pytest
+
 from seestar_sync.manifest import Manifest
 
 
@@ -625,6 +647,25 @@ def test_mark_deleted_is_audited(tmp_path):
         assert row.deleted_tier == 1
         # deletion audit does not un-verify the file
         assert m.verified_ok("a.fit", 100, 1000.0)
+
+
+def test_mark_deleted_without_row_refuses(tmp_path):
+    # write-ahead audit must be self-enforcing, not caller-dependent
+    with make(tmp_path) as m:
+        with pytest.raises(LookupError, match="no manifest row"):
+            m.mark_deleted("ghost.fit", tier=1, deleted_at="2026-07-09T02:00:00Z")
+
+
+def test_recopy_clears_delete_audit(tmp_path):
+    # load-bearing for false-delete reconciliation: a re-verified file must
+    # shed its stale delete audit
+    with make(tmp_path) as m:
+        m.record_verified("a.fit", 100, 1000.0, "abc", "2026-07-09T00:00:00Z")
+        m.mark_deleted("a.fit", tier=1, deleted_at="2026-07-09T01:00:00Z")
+        m.record_verified("a.fit", 100, 1000.0, "abc", "2026-07-09T02:00:00Z")
+        row = m.get("a.fit")
+        assert row.deleted_from_device_at is None
+        assert row.deleted_tier is None
 
 
 def test_failure_counter(tmp_path):
@@ -742,11 +783,20 @@ class Manifest:
         )
 
     def mark_deleted(self, path: str, tier: int, deleted_at: str) -> None:
-        """Write-ahead audit: MUST be committed before the SMB delete is issued."""
-        self._conn.execute(
+        """Write-ahead audit: MUST be committed before the SMB delete is issued.
+
+        Self-enforcing: refuses to audit a path with no manifest row, so a
+        caller that skipped verification cannot produce an unrecorded delete.
+        """
+        cur = self._conn.execute(
             "UPDATE files SET deleted_from_device_at = ?, deleted_tier = ? WHERE path = ?",
             (deleted_at, tier, path),
         )
+        if cur.rowcount == 0:
+            raise LookupError(
+                f"refusing to audit deletion of {path!r}: no manifest row — "
+                "deleting a file without a verified-copy record is forbidden"
+            )
         self._conn.commit()
 
     def bump_failure(self, path: str) -> int:
@@ -771,7 +821,7 @@ class Manifest:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_manifest.py -v`
-Expected: 5 passed
+Expected: 8 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2244,8 +2294,6 @@ def test_rebuild_manifest(tmp_path):
 
 Run: `uv run pytest tests/test_cli.py -v`
 Expected: FAIL — `ModuleNotFoundError`
-
-Cross-file note for this task's implementer: the `LOG_LEVEL` validation shown in plan Task 1's `Config.from_env` was added after Batch A shipped (SDET finding). If `src/seestar_sync/config.py` doesn't yet validate `LOG_LEVEL` against DEBUG/INFO/WARNING/ERROR/CRITICAL, add that block (and a `test_bad_log_level_is_fatal` ConfigError test in `tests/test_config.py`) as part of this task, TDD as usual — the CLI test below depends on it.
 
 - [ ] **Step 3: Implement `src/seestar_sync/cli.py`**
 
