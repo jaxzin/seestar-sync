@@ -1,0 +1,14 @@
+services:
+  seestar-sync:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 60s   # let an in-flight run wind down; SIGKILL is .part-safe anyway
+    environment:
+      SEESTAR_HOST: ${SEESTAR_HOST:?set SEESTAR_HOST in .env}
+      DRY_RUN: ${DRY_RUN:-true}          # rollout: stays true until dry-run output is reviewed
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-15}
+      KUMA_PUSH_URL: ${KUMA_PUSH_URL:-}
+      HA_WEBHOOK_URL: ${HA_WEBHOOK_URL:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ${ARCHIVE_HOST_PATH:?set ARCHIVE_HOST_PATH in .env}:/archive
