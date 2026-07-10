@@ -94,6 +94,12 @@ class Config:
             # a zero/negative window would silently disable it
             raise ConfigError(f"ACTIVE_WINDOW_MINUTES must be >= 1, got {window}")
 
+        log_level = env.get("LOG_LEVEL", "INFO").upper()
+        if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            raise ConfigError(
+                f"LOG_LEVEL must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL, got {log_level!r}"
+            )
+
         return cls(
             seestar_host=host,
             archive_dir=Path(env.get("ARCHIVE_DIR", "/archive")),
@@ -106,5 +112,5 @@ class Config:
             ha_webhook_url=_http_url(env, "HA_WEBHOOK_URL"),
             dry_run=_bool(env, "DRY_RUN"),
             archive_on_root_fs_ok=_bool(env, "ARCHIVE_ON_ROOT_FS_OK"),
-            log_level=env.get("LOG_LEVEL", "INFO").upper(),
+            log_level=log_level,
         )

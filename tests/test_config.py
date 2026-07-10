@@ -67,6 +67,12 @@ def test_webhook_urls_must_be_http():
     assert cfg.ha_webhook_url == "https://ha.local/api/webhook/x"
 
 
+def test_bad_log_level_is_fatal():
+    with pytest.raises(ConfigError, match="LOG_LEVEL"):
+        Config.from_env(base_env(LOG_LEVEL="banana"))
+    assert Config.from_env(base_env(LOG_LEVEL="debug")).log_level == "DEBUG"
+
+
 def test_garbage_bool_is_fatal():
     for raw in ("0", "no", "off"):
         assert Config.from_env(base_env(DRY_RUN=raw)).dry_run is False
