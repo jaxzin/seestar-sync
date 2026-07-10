@@ -3,10 +3,14 @@
 Run: MQTT_LIVE_TEST=1 MQTT_HOST=<broker> MQTT_USERNAME=u MQTT_PASSWORD=p \
      uv run pytest tests/test_mqtt_live.py -v -s
 Publishes discovery + availability to the real broker under the
-'seestar-sync-livetest' prefix, then cleans up. Manual checklist afterward:
-device appears in HA MQTT integration; toggle DRY_RUN from the dashboard and
-confirm settings.json in a scratch dir picks it up; docker stop flips the
-availability entity to unavailable (LWT).
+'seestar-sync-livetest' prefix. NOTE: the retained discovery configs persist
+on the broker after rep.stop(), so a greyed-out ghost "Seestar Sync" device
+(livetest prefix) remains in HA. Manual checklist afterward: device appears
+in HA MQTT integration; toggle DRY_RUN from the dashboard and confirm
+settings.json in a scratch dir picks it up; docker stop flips the
+availability entity to unavailable (LWT); finally, delete the ghost livetest
+device via HA's MQTT integration UI (Settings → Devices → device → Delete —
+HA publishes the empty retained configs itself).
 """
 
 import os
