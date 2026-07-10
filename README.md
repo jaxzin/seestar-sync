@@ -34,13 +34,29 @@ for in-app browsing are never touched, and never even reachable by the deleter.
 
 ## Rollout sequence
 
-`docker-compose.yml` defaults `DRY_RUN` to `true`. Leave it there for the first several
-days: the daemon will log every file it *would* copy and delete, and write the planned
-totals into `status.json`, without touching the device or the archive. (The per-file
-plan appears only in the logs; `status.json` carries the counts.) Review the logs and
-`status.json` across a few runs — especially the reclaim side, since deletes are
-one-way — then set `DRY_RUN=false` in `.env` and restart. Reclaim behavior should be the
-last thing you trust, not the first.
+Two switches control how much the tool is allowed to do: `DRY_RUN` (plan vs. execute)
+and `RECLAIM_ENABLED` (whether deletion exists at all). Graduate through four phases,
+and let reclaim graduate last — deletes are one-way:
+
+1. **`DRY_RUN=true`** (the compose default) — run for the first several days. The
+   daemon logs every file it *would* copy and writes the planned totals into
+   `status.json`, without touching the device or the archive. (The per-file plan
+   appears only in the logs; `status.json` carries the counts.) Review the copy plans
+   across a few runs.
+2. **`DRY_RUN=false`, `RECLAIM_ENABLED=false`** (both env-var defaults) — real copies
+   start landing on the NAS, but deletion is structurally impossible: with
+   `RECLAIM_ENABLED=false` the reclaim phase never runs, no matter how full the device
+   gets. Let this run until the archive has verified copies of your library.
+3. **`DRY_RUN=true`, `RECLAIM_ENABLED=true`** — back to dry-run, now with reclaim
+   switched on: the logs show the real per-file *deletion* plan without executing it.
+   This review is only meaningful after phase 2 has landed verified copies — reclaim
+   considers only NAS-verified files, so with an empty archive the deletion plan would
+   be empty too. Eyeball the plan across a few runs; this is the step that earns your
+   trust before anything is removed from the telescope.
+4. **`DRY_RUN=false`, `RECLAIM_ENABLED=true`** — full operation: verified copies plus
+   tiered space reclamation.
+
+Reclaim behavior should be the last thing you trust, not the first.
 
 ## Configuration
 
@@ -52,7 +68,8 @@ under Docker, `docker compose`, or a bare `uv run seestar-sync`).
 | `SEESTAR_HOST` | *(required)* | Hostname or IP of the telescope. Missing/blank is a fatal config error. |
 | `ARCHIVE_DIR` | `/archive` | Root of the archive mirror inside the container. Files land under `ARCHIVE_DIR/MyWorks/`. |
 | `SYNC_INTERVAL_MINUTES` | `15` | Daemon loop interval. Must be an integer `>= 1`. |
-| `RECLAIM_TRIGGER_PERCENT` | `75` | Device-used-percent that triggers a reclaim pass. |
+| `RECLAIM_ENABLED` | `false` | Master switch for deletion: while `false`, the reclaim phase never runs — regardless of the trigger/target settings or how full the device is — and the tool is copy-only (device fill level is still reported for monitoring). Deletion is opt-in. Same boolean parsing as `DRY_RUN`. |
+| `RECLAIM_TRIGGER_PERCENT` | `75` | Device-used-percent that triggers a reclaim pass (only when `RECLAIM_ENABLED=true`). |
 | `RECLAIM_TARGET_PERCENT` | `60` | Reclaim deletes (oldest session first, by tier) until usage drops to this level. Must be `0 < target < trigger <= 100`. |
 | `ACTIVE_WINDOW_MINUTES` | `15` | Per-folder session guard: a top-level folder with any write inside this window is skipped for both copy and reclaim. Must be `>= 1` — it's a delete-safety feature and can't be disabled. |
 | `DEVICE_CAPACITY_GB` | *(unset)* | Fallback total capacity, in GB, used only if the device won't answer a free-space query (see below). Must be a positive number if set. |

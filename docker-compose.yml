@@ -7,6 +7,7 @@ services:
       SEESTAR_HOST: ${SEESTAR_HOST:?set SEESTAR_HOST in .env}
       DRY_RUN: ${DRY_RUN:-true}          # rollout: stays true until dry-run output is reviewed
       SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-15}
+      RECLAIM_ENABLED: ${RECLAIM_ENABLED:-false}   # deletion is opt-in
       RECLAIM_TRIGGER_PERCENT: ${RECLAIM_TRIGGER_PERCENT:-75}
       RECLAIM_TARGET_PERCENT: ${RECLAIM_TARGET_PERCENT:-60}
       ACTIVE_WINDOW_MINUTES: ${ACTIVE_WINDOW_MINUTES:-15}
