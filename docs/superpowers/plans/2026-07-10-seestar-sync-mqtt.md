@@ -798,6 +798,13 @@ def test_invalid_host_command_rejected_and_reechoed(tmp_path):
     assert "seestar_host" not in store.load()
     assert ("seestar-sync/settings/seestar_host", "seestar.local", True) in fake.published
 
+    # nonempty-but-invalid host: the strict validator rejects at store.set;
+    # HA must still snap back (targeted rejection path, not the generic guard)
+    fake.published.clear()
+    fake.on_message(fake, None, Msg("seestar-sync/set/seestar_host", b"bad host"))
+    assert "seestar_host" not in store.load()
+    assert ("seestar-sync/settings/seestar_host", "seestar.local", True) in fake.published
+
 
 def test_stop_publishes_offline_retained(tmp_path):
     # LWT only fires on UNGRACEFUL death; clean shutdown must publish offline
@@ -1029,7 +1036,14 @@ class MqttReporter:
             from .syncrun import iso
 
             old = self._store.load().get(key, "<unset>")
-            self._store.set(key, value, iso(time.time()))
+            try:
+                self._store.set(key, value, iso(time.time()))
+            except ValueError as e:
+                # validator rejected (e.g. whitespace host): targeted warning
+                # + re-echo so HA snaps back — spec §Failure isolation
+                log.warning("mqtt: rejected %s command %r: %s", key, value, e)
+                self._echo_current(key)
+                return
             log.warning("settings override via MQTT: %s: %s -> %s (applies next pass)",
                         key, old, value)
             self._echo_current(key)
