@@ -23,7 +23,14 @@ def _guard(name: str, fn, *args) -> None:
     try:
         fn(*args)
     except Exception as e:  # noqa: BLE001 — reporters must never raise
-        log.warning("reporter %s failed (non-fatal): %s", name, e)
+        # Push/webhook URLs carry secret tokens and some exceptions echo
+        # their input (e.g. urllib's "unknown url type: '<url>'") — redact
+        # any string argument from the logged text.
+        msg = str(e)
+        for arg in args:
+            if isinstance(arg, str) and arg and arg in msg:
+                msg = msg.replace(arg, "<redacted-url>")
+        log.warning("reporter %s failed (non-fatal): %s", name, msg)
 
 
 def write_status(meta_dir: Path, summary: RunSummary) -> None:
