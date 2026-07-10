@@ -67,6 +67,12 @@ def test_webhook_urls_must_be_http():
     assert cfg.ha_webhook_url == "https://ha.local/api/webhook/x"
 
 
+def test_reclaim_is_opt_in():
+    # deletion must be explicitly enabled — a default config can never reclaim
+    assert Config.from_env(base_env()).reclaim_enabled is False
+    assert Config.from_env(base_env(RECLAIM_ENABLED="true")).reclaim_enabled is True
+
+
 def test_bad_log_level_is_fatal():
     with pytest.raises(ConfigError, match="LOG_LEVEL"):
         Config.from_env(base_env(LOG_LEVEL="banana"))

@@ -51,6 +51,7 @@ class Config:
     seestar_host: str
     archive_dir: Path
     sync_interval_minutes: int
+    reclaim_enabled: bool
     reclaim_trigger_percent: float
     reclaim_target_percent: float
     active_window_minutes: int
@@ -105,6 +106,8 @@ class Config:
             seestar_host=host,
             archive_dir=Path(env.get("ARCHIVE_DIR", "/archive")),
             sync_interval_minutes=interval,
+            # deletion is opt-in (user-ratified): default false = copy-only
+            reclaim_enabled=_bool(env, "RECLAIM_ENABLED"),
             reclaim_trigger_percent=trigger,
             reclaim_target_percent=target,
             active_window_minutes=window,
