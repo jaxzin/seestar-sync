@@ -497,6 +497,7 @@ class RunSummary:
     started_at: str  # ISO 8601 UTC
     result: str  # ok | partial | skipped_unreachable | error
     dry_run: bool = False
+    reclaim_enabled: bool = False  # machine-readable copy-only signal
     files_copied: int = 0
     bytes_copied: int = 0
     files_deleted: int = 0
@@ -510,6 +511,7 @@ class RunSummary:
             "last_run": self.started_at,
             "result": self.result,
             "dry_run": self.dry_run,
+            "reclaim_enabled": self.reclaim_enabled,
             "files_copied": self.files_copied,
             "bytes_copied": self.bytes_copied,
             "files_deleted": self.files_deleted,
@@ -1621,9 +1623,9 @@ def test_write_status_snapshot(tmp_path):
     data = json.loads((tmp_path / "status.json").read_text())
     # exact spec contract — this JSON is also the HA webhook payload
     assert set(data) == {
-        "last_run", "result", "dry_run", "files_copied", "bytes_copied",
-        "files_deleted", "bytes_reclaimed", "device_used_percent",
-        "active_folders_skipped", "errors",
+        "last_run", "result", "dry_run", "reclaim_enabled", "files_copied",
+        "bytes_copied", "files_deleted", "bytes_reclaimed",
+        "device_used_percent", "active_folders_skipped", "errors",
     }
     assert data["result"] == "ok"
     assert data["files_copied"] == 2
@@ -2026,6 +2028,8 @@ def test_reclaim_disabled_by_default_is_copy_only(env):
     assert len(d.list_files()) == 1  # nothing deleted
     assert s.device_used_percent == 80.0  # fill level still reported
     assert s.result == "ok"
+    assert s.reclaim_enabled is False  # machine-readable copy-only signal
+    assert s.to_json()["reclaim_enabled"] is False  # reaches status.json/HA
 
 
 def test_dry_run_touches_nothing(env):
@@ -2159,7 +2163,10 @@ def run_sync(
     """
     now = time.time() if now is None else now
     should_stop = should_stop or (lambda: False)
-    summary = RunSummary(started_at=iso(now), result="ok", dry_run=config.dry_run)
+    summary = RunSummary(
+        started_at=iso(now), result="ok",
+        dry_run=config.dry_run, reclaim_enabled=config.reclaim_enabled,
+    )
 
     try:
         files = device.list_files()
@@ -2872,7 +2879,8 @@ def _one_run(config: Config, archive: Archive, device_factory, should_stop=None)
         from .models import RunSummary
 
         summary = RunSummary(started_at=iso(time.time()), result="skipped_unreachable",
-                             dry_run=config.dry_run)
+                             dry_run=config.dry_run,
+                             reclaim_enabled=config.reclaim_enabled)
         report_all(config, archive.meta_dir, summary)
         return 0
     with Manifest(archive.meta_dir / "manifest.db") as manifest:
@@ -2920,7 +2928,10 @@ def _cmd_status(config: Config, args, device_factory) -> int:
         return 0
     data = json.loads(status_path.read_text())
     print(f"last run: {data['last_run']}")
-    print(f"result: {data['result']}" + ("  (dry run)" if data.get("dry_run") else ""))
+    mode = ("  (dry run)" if data.get("dry_run") else "") + (
+        "  (copy-only)" if not data.get("reclaim_enabled") else ""
+    )
+    print(f"result: {data['result']}{mode}")
     print(f"copied: {data['files_copied']} files / {data['bytes_copied']:,} bytes")
     print(f"reclaimed: {data['files_deleted']} files / {data['bytes_reclaimed']:,} bytes")
     if data.get("device_used_percent") is not None:
