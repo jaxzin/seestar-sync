@@ -40,10 +40,25 @@ def test_error_mapping_wraps_connection_failures():
     with pytest.raises(DeviceUnavailable):
         with c._map_errors():
             raise ConnectionResetError("gone")
+    # smbprotocol wraps connect failures in ValueError — the routine
+    # powered-off-telescope case must map to DeviceUnavailable, not crash
+    with pytest.raises(DeviceUnavailable):
+        with c._map_errors():
+            raise ValueError("Failed to connect to 'seestar.local:445': timed out")
     # FileNotFoundError must pass through untouched (stat contract)
     with pytest.raises(FileNotFoundError):
         with c._map_errors():
             raise FileNotFoundError("missing")
+
+
+def test_traversal_rejection_still_fails_loud():
+    # the widened _map_errors tuple must NOT swallow _unc's containment
+    # check — UNC paths are built before entering the mapping context
+    c = client()
+    c._host = "h"
+    for op in (lambda: c.stat("../escape.fit"), lambda: c.delete_file("../escape.fit")):
+        with pytest.raises(ValueError, match="unsafe device path"):
+            op()
 
 
 def test_disk_usage_fallback_uses_capacity(monkeypatch):

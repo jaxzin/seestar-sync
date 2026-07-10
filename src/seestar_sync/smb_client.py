@@ -86,18 +86,26 @@ class SmbDeviceClient:
 
     @contextmanager
     def _map_errors(self):
-        """Connectivity problems -> DeviceUnavailable; missing files pass through."""
+        """Connectivity problems -> DeviceUnavailable; missing files pass through.
+
+        ValueError is in the tuple because smbprotocol's transport wraps
+        connect failures in ValueError ("Failed to connect to '<host>:445':
+        timed out") — the routine powered-off-telescope case. UNC paths are
+        built BEFORE entering this context, so _unc's own fail-loud
+        ValueError ("unsafe device path") is never swallowed here.
+        """
         try:
             yield
         except FileNotFoundError:
             raise
-        except (SMBException, ConnectionError, TimeoutError, OSError) as e:
+        except (SMBException, ConnectionError, TimeoutError, OSError, ValueError) as e:
             raise DeviceUnavailable(f"{self._host}: {e}") from e
 
     def list_files(self) -> list[DeviceFile]:
         out: list[DeviceFile] = []
+        root_unc = self._unc()  # UNC built outside _map_errors (see its docstring)
         with self._map_errors():
-            self._scan(self._unc(), "", out)
+            self._scan(root_unc, "", out)
         return out
 
     def _scan(self, unc: str, rel_prefix: str, out: list[DeviceFile]) -> None:
@@ -110,18 +118,21 @@ class SmbDeviceClient:
                 out.append(DeviceFile(rel, st.st_size, st.st_mtime))
 
     def stat(self, path: str) -> DeviceFile:
+        unc = self._unc(path)
         with self._map_errors():
-            st = smbclient.stat(self._unc(path))
+            st = smbclient.stat(unc)
         return DeviceFile(path, st.st_size, st.st_mtime)
 
     def open_read(self, path: str) -> BinaryIO:
+        unc = self._unc(path)
         with self._map_errors():
-            raw = smbclient.open_file(self._unc(path), mode="rb")
+            raw = smbclient.open_file(unc, mode="rb")
         return _MappedReader(raw, self._map_errors)
 
     def delete_file(self, path: str) -> None:
+        unc = self._unc(path)
         with self._map_errors():
-            smbclient.remove(self._unc(path))
+            smbclient.remove(unc)
 
     def remove_dir_if_empty(self, folder: str) -> bool:
         # Deliberately NOT via _map_errors: a failed empty-dir cleanup is
