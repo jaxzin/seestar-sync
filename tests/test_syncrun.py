@@ -235,11 +235,15 @@ def test_dry_run_reclaim_reports_plan_without_touching_anything(env):
     d.put(path, b"x" * 8000, mtime=1.0)
     run_sync(d, archive, manifest, config(), now=1_000_000.0)  # copy + verify
     d.capacity = 10_000  # now 80% used → reclaim pressure
-    s = run_sync(d, archive, manifest, config(DRY_RUN="true"), now=1_000_100.0)
+    obs = RecordingObserver()
+    s = run_sync(d, archive, manifest, config(DRY_RUN="true"), now=1_000_100.0,
+                 observer=obs)
     assert s.dry_run is True
     assert s.files_deleted == 1 and s.bytes_reclaimed == 8000  # plan reported
     assert len(d.list_files()) == 1  # nothing actually deleted
     assert manifest.get(path).deleted_from_device_at is None  # no audit row
+    # dashboard-visible: the dry-run deletion plan reaches observers too
+    assert [e for e in obs.events if e.phase == "reclaiming"]
 
 
 def test_changed_file_is_skipped_at_delete_time(env):
@@ -283,6 +287,7 @@ def test_observer_sequence_for_copy_pass(env):
     run_sync(d, archive, manifest, config(), now=1_000_000.0, observer=obs)
     assert obs.phases()[0] == "listing"
     assert obs.phases()[-1] == "done"
+    assert obs.phases().count("done") == 1  # exactly once, per contract
     copying = [e for e in obs.events if e.phase == "copying"]
     assert copying[0].files_total == 2 and copying[0].bytes_total == 30
     assert copying[0].files_done == 0  # the plan-known announcement
@@ -301,6 +306,7 @@ def test_observer_sequence_for_reclaim_and_done_totals(env):
     assert reclaiming[-1].files_done == 1 and reclaiming[-1].bytes_done == 800
     done = obs.events[-1]
     assert done.phase == "done" and done.files_done == 1  # copies in done event
+    assert obs.phases().count("done") == 1
 
 
 def test_observer_unreachable_pass_emits_listing_then_done(env):
@@ -312,7 +318,26 @@ def test_observer_unreachable_pass_emits_listing_then_done(env):
 
     obs = RecordingObserver()
     run_sync(Dead(), archive, manifest, config(), now=1_000_000.0, observer=obs)
-    assert obs.phases() == ["listing", "done"]
+    assert obs.phases() == ["listing", "done"]  # exact — implies done once
+
+
+def test_observer_mid_run_disconnect_still_emits_done(env):
+    # done must close EVERY pass — a power-off mid-copy can't strand the
+    # consumer's state topic in "copying" until the next pass
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000)
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * 10, mtime=1.0)
+    d.put("B_sub/Light_b_20250102-000000.fit", b"b" * 20, mtime=1.0)
+    d.fail_after_reads = 1
+    obs = RecordingObserver()
+    run_sync(d, archive, manifest, config(), now=1_000_000.0, observer=obs)
+    assert obs.phases()[0] == "listing"
+    assert obs.phases()[-1] == "done"
+    assert obs.phases().count("done") == 1
+    copying = [e for e in obs.events if e.phase == "copying"]
+    assert copying[-1].files_done == 1  # banked progress visible
+    assert copying[-1].current_path == "A_sub/Light_a_20250101-000000.fit"
+    assert obs.events[-1].files_done == 1  # done carries banked totals
 
 
 def test_observer_dry_run_emits_planned_counts(env):
@@ -324,6 +349,7 @@ def test_observer_dry_run_emits_planned_counts(env):
     copying = [e for e in obs.events if e.phase == "copying"]
     assert copying[-1].files_done == 1  # planned count, same shape as real
     assert obs.phases()[-1] == "done"
+    assert obs.phases().count("done") == 1
 
 
 def test_disconnect_during_delete_leaves_self_healing_audit(env):

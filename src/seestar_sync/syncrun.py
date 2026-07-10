@@ -112,8 +112,9 @@ def _copy_phase(
     bytes_total = sum(f.size for f in plan)
     files_done = 0
     bytes_done = 0
-    notify(ProgressEvent(phase="copying", files_total=files_total,
-                         bytes_total=bytes_total))
+    if plan:  # idle passes emit only listing/done — no "copying 0/0" state blip
+        notify(ProgressEvent(phase="copying", files_total=files_total,
+                             bytes_total=bytes_total))
     for f in plan:
         if should_stop():
             log.info("shutdown requested; stopping copy phase between files")
