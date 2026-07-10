@@ -63,3 +63,19 @@ class RunSummary:
             "active_folders_skipped": self.active_folders_skipped,
             "errors": self.errors,
         }
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    """Live pass telemetry for observers (e.g. the MQTT reporter).
+
+    Emitted synchronously from inside run_sync; consumers own throttling
+    and must never raise.
+    """
+
+    phase: str  # listing | copying | reclaiming | done
+    files_done: int = 0
+    files_total: int = 0
+    bytes_done: int = 0
+    bytes_total: int = 0
+    current_path: str | None = None

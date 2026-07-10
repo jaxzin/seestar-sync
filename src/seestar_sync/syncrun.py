@@ -21,7 +21,7 @@ from .classify import active_folders, top_folder
 from .config import Config
 from .device import DeviceClient, DeviceUnavailable, FreeSpaceUnavailable
 from .manifest import Manifest
-from .models import RunSummary, Tier
+from .models import ProgressEvent, RunSummary, Tier
 from .planner import plan_copies
 from .reclaim import plan_reclaim
 
@@ -41,25 +41,33 @@ def run_sync(
     config: Config,
     now: float | None = None,
     should_stop: Callable[[], bool] | None = None,
+    observer: Callable[[ProgressEvent], None] | None = None,
 ) -> RunSummary:
     """Execute one sync pass and return its summary.
 
     should_stop is a cooperative shutdown check, polled between files (copy
     phase) and between deletions (reclaim phase) — it never tears an
     in-flight transfer or splits the audit→delete pair.
+
+    observer, if given, is invoked synchronously with ProgressEvent updates
+    (see models.ProgressEvent). Consumers own throttling and must never
+    raise — run_sync does NOT guard observer callbacks.
     """
     now = time.time() if now is None else now
     should_stop = should_stop or (lambda: False)
+    notify = observer or (lambda e: None)
     summary = RunSummary(
         started_at=iso(now), result="ok",
         dry_run=config.dry_run, reclaim_enabled=config.reclaim_enabled,
     )
 
+    notify(ProgressEvent(phase="listing"))
     try:
         files = device.list_files()
     except DeviceUnavailable as e:
         log.info("device unreachable, skipping run: %s", e)
         summary.result = "skipped_unreachable"
+        notify(ProgressEvent(phase="done"))
         return summary
 
     active = active_folders(files, now=now, window_minutes=config.active_window_minutes)
@@ -68,13 +76,13 @@ def run_sync(
         log.info("session guard: skipping active folders %s", sorted(active))
 
     device_gone = _copy_phase(
-        device, archive, manifest, config, files, active, summary, now, should_stop
+        device, archive, manifest, config, files, active, summary, now, should_stop, notify
     )
 
     if not device_gone and not should_stop():
         if config.reclaim_enabled:
             _reclaim_phase(
-                device, manifest, config, files, active, summary, now, should_stop
+                device, manifest, config, files, active, summary, now, should_stop, notify
             )
         else:
             # deletion is opt-in (user-ratified): copy-only mode still
@@ -84,15 +92,29 @@ def run_sync(
 
     if summary.errors:
         summary.result = "partial"
+    notify(ProgressEvent(
+        phase="done",
+        files_done=summary.files_copied,
+        bytes_done=summary.bytes_copied,
+        files_total=summary.files_copied,
+        bytes_total=summary.bytes_copied,
+    ))
     return summary
 
 
 def _copy_phase(
-    device, archive, manifest, config, files, active, summary, now, should_stop
+    device, archive, manifest, config, files, active, summary, now, should_stop, notify
 ) -> bool:
     """Returns True if the device vanished mid-phase."""
     is_synced = lambda f: manifest.verified_ok(f.path, f.size, f.mtime)  # noqa: E731
-    for f in plan_copies(files, is_synced, active):
+    plan = plan_copies(files, is_synced, active)
+    files_total = len(plan)
+    bytes_total = sum(f.size for f in plan)
+    files_done = 0
+    bytes_done = 0
+    notify(ProgressEvent(phase="copying", files_total=files_total,
+                         bytes_total=bytes_total))
+    for f in plan:
         if should_stop():
             log.info("shutdown requested; stopping copy phase between files")
             break
@@ -105,6 +127,11 @@ def _copy_phase(
             log.info("DRY_RUN would copy %s (%d bytes)", f.path, f.size)
             summary.files_copied += 1
             summary.bytes_copied += f.size
+            files_done += 1
+            bytes_done += f.size
+            notify(ProgressEvent(phase="copying", files_done=files_done,
+                                 files_total=files_total, bytes_done=bytes_done,
+                                 bytes_total=bytes_total, current_path=f.path))
             continue
         try:
             with device.open_read(f.path) as reader:
@@ -125,6 +152,11 @@ def _copy_phase(
         manifest.clear_failure(f.path)
         summary.files_copied += 1
         summary.bytes_copied += f.size
+        files_done += 1
+        bytes_done += f.size
+        notify(ProgressEvent(phase="copying", files_done=files_done,
+                             files_total=files_total, bytes_done=bytes_done,
+                             bytes_total=bytes_total, current_path=f.path))
         log.info("copied %s (%d bytes)", f.path, f.size)
     return False
 
@@ -138,7 +170,7 @@ def _report_usage_only(device, summary) -> None:
 
 
 def _reclaim_phase(
-    device, manifest, config, files, active, summary, now, should_stop
+    device, manifest, config, files, active, summary, now, should_stop, notify
 ) -> None:
     try:
         usage = device.disk_usage()
@@ -156,6 +188,13 @@ def _reclaim_phase(
                 "device at %.1f%% used (trigger %.0f%%): no reclaim needed",
                 usage.used_percent, config.reclaim_trigger_percent,
             )
+        files_total = len(plan)
+        bytes_total = sum(d.file.size for d in plan)
+        files_done = 0
+        bytes_done = 0
+        if plan:
+            notify(ProgressEvent(phase="reclaiming", files_total=files_total,
+                                 bytes_total=bytes_total))
         emptied_sub_folders: set[str] = set()
         for d in plan:
             if should_stop():
@@ -166,6 +205,11 @@ def _reclaim_phase(
                          d.tier, d.file.path, d.file.size)
                 summary.files_deleted += 1
                 summary.bytes_reclaimed += d.file.size
+                files_done += 1
+                bytes_done += d.file.size
+                notify(ProgressEvent(phase="reclaiming", files_done=files_done,
+                                     files_total=files_total, bytes_done=bytes_done,
+                                     bytes_total=bytes_total, current_path=d.file.path))
                 continue
             # Preconditions re-checked at delete time, not plan time:
             try:
@@ -185,6 +229,11 @@ def _reclaim_phase(
                 continue
             summary.files_deleted += 1
             summary.bytes_reclaimed += d.file.size
+            files_done += 1
+            bytes_done += d.file.size
+            notify(ProgressEvent(phase="reclaiming", files_done=files_done,
+                                 files_total=files_total, bytes_done=bytes_done,
+                                 bytes_total=bytes_total, current_path=d.file.path))
             log.info("deleted [tier %d] %s (%d bytes)", d.tier, d.file.path, d.file.size)
             if d.tier == Tier.SUBS:
                 emptied_sub_folders.add(top_folder(d.file.path))
