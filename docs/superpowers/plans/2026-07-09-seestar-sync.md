@@ -77,7 +77,7 @@ description = "Mirror Seestar S30 Pro media to a NAS over SMB and reclaim device
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["smbprotocol>=1.13"]
+dependencies = ["smbprotocol>=1.13,<2"]
 
 [project.scripts]
 seestar-sync = "seestar_sync.cli:main"
@@ -789,6 +789,15 @@ def test_short_read_raises_verify_error_and_leaves_no_part(tmp_path):
         a.write_stream("M 81_sub/torn.fit", io.BytesIO(data), expected_size=999, mtime=0.0)
     assert not a.dest_path("M 81_sub/torn.fit").exists()
     assert not list((a.root / "MyWorks" / "M 81_sub").glob("*.part"))
+
+
+def test_dest_path_rejects_traversal(tmp_path):
+    # device filenames are device-controlled input: contain them under MyWorks
+    a = make_archive(tmp_path)
+    a.init(allow_root_fs=False)
+    for evil in ("../escape.fit", "a/../../escape.fit", "/etc/passwd", "a\\..\\b.fit"):
+        with pytest.raises(ArchiveError, match="unsafe device path"):
+            a.dest_path(evil)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -870,7 +879,21 @@ class Archive:
             )
 
     def dest_path(self, device_path: str) -> Path:
-        return self.root / "MyWorks" / Path(device_path)
+        """Map a device-relative path into the archive mirror.
+
+        Device filenames are untrusted input (they come off the telescope):
+        reject anything that could escape <root>/MyWorks.
+        """
+        base = self.root / "MyWorks"
+        pure = Path(device_path)
+        if (
+            pure.is_absolute()
+            or "\\" in device_path
+            or ".." in pure.parts
+            or not (base / pure).resolve().is_relative_to(base.resolve())
+        ):
+            raise ArchiveError(f"unsafe device path rejected: {device_path!r}")
+        return base / pure
 
     def write_stream(
         self, device_path: str, reader: BinaryIO, expected_size: int, mtime: float
@@ -1843,6 +1866,15 @@ def test_rel_path_from_unc():
     assert c._rel(unc) == "M 81_sub/Light_a.fit"
 
 
+def test_unc_rejects_traversal():
+    # the delete side of path containment: never build a UNC that escapes MyWorks
+    c = client()
+    c._host = "h"
+    for evil in ("../x.fit", "a/../x.fit", "a\\x.fit", "/abs.fit", "a//b.fit"):
+        with pytest.raises(ValueError, match="unsafe device path"):
+            c._unc(evil)
+
+
 def test_error_mapping_wraps_connection_failures():
     c = client()
     c._host = "seestar.local"
@@ -1919,6 +1951,11 @@ class SmbDeviceClient:
         base = rf"\\{self._host}\{SHARE}\{ROOT}"
         if not rel:
             return base
+        # rel is device-controlled: refuse anything that could address outside
+        # MyWorks (deletion is the high-blast-radius path through here).
+        parts = rel.split("/")
+        if rel.startswith("/") or "\\" in rel or ".." in parts or "" in parts:
+            raise ValueError(f"unsafe device path rejected: {rel!r}")
         return base + "\\" + rel.replace("/", "\\")
 
     def _rel(self, unc: str) -> str:
@@ -2120,7 +2157,9 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -2175,13 +2214,26 @@ def _cmd_run(config: Config, args, device_factory) -> int:
 def _cmd_daemon(config: Config, args, device_factory) -> int:
     archive = _prepare(config, args.init)
     interval = config.sync_interval_minutes * 60
+    stop = threading.Event()
+
+    def _handle_signal(signum, frame):
+        log.info("received signal %d; exiting after current run", signum)
+        stop.set()
+
+    # The container runs this as PID 1: without a handler, docker stop's
+    # SIGTERM would be ignored and Docker would SIGKILL after the grace
+    # period. A mid-copy SIGKILL is safe (.part discipline) but graceless.
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     log.info("daemon: syncing %s every %d min", config.seestar_host,
              config.sync_interval_minutes)
-    while True:
+    while not stop.is_set():
         code = _one_run(config, archive, device_factory)
         if code != 0:
             log.warning("run finished with errors (exit %d); continuing", code)
-        time.sleep(interval)
+        stop.wait(interval)  # interruptible, unlike time.sleep
+    return 0
 
 
 def _cmd_status(config: Config, args, device_factory) -> int:
@@ -2319,6 +2371,9 @@ RUN uv sync --frozen --no-dev
 FROM python:3.12-slim-bookworm
 COPY --from=build /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
+# Deliberately no USER directive: the archive volume's ownership varies by
+# host (Mac SMB mounts, NAS bind mounts). k8s deployments should set a
+# securityContext/fsGroup instead. Documented in the README.
 ENTRYPOINT ["seestar-sync"]
 CMD ["daemon"]
 ```
@@ -2340,6 +2395,7 @@ services:
   seestar-sync:
     build: .
     restart: unless-stopped
+    stop_grace_period: 60s   # let an in-flight run wind down; SIGKILL is .part-safe anyway
     environment:
       SEESTAR_HOST: ${SEESTAR_HOST:?set SEESTAR_HOST in .env}
       DRY_RUN: ${DRY_RUN:-true}          # rollout: stays true until dry-run output is reviewed
@@ -2368,7 +2424,7 @@ Expected: `archive error: ... does not exist — is the volume mounted?` (or the
 
 - [ ] **Step 4: Write `README.md`**
 
-Content requirements (write actual prose, not headings-only): what the tool does (one paragraph, mention keeping stacked JPGs on-device); quick start on a Mac (create `.env` with `SEESTAR_HOST`, `ARCHIVE_HOST_PATH`; mount the NAS share in Finder first; `docker compose up -d`); the first-run `--init` step (`docker compose run --rm seestar-sync run --init`); the rollout sequence (DRY_RUN=true → review logs/`status.json` → DRY_RUN=false); full env-var table copied from the spec §Operator interface; CLI subcommands and exit codes; how reclaim tiers work and what is never deleted (stacked JPGs/thumbnails); link to the spec at `docs/superpowers/specs/2026-07-09-seestar-nas-sync-design.md`.
+Content requirements (write actual prose, not headings-only): what the tool does (one paragraph, mention keeping stacked JPGs on-device); quick start on a Mac (create `.env` with `SEESTAR_HOST`, `ARCHIVE_HOST_PATH`; mount the NAS share in Finder first; `docker compose up -d`); the first-run `--init` step (`docker compose run --rm seestar-sync run --init`); the rollout sequence (DRY_RUN=true → review logs/`status.json` → DRY_RUN=false); full env-var table copied from the spec §Operator interface; CLI subcommands and exit codes; how reclaim tiers work and what is never deleted (stacked JPGs/thumbnails); why the container runs as root by default (archive volume ownership varies across Mac SMB mounts and NAS bind mounts) and that k8s should use securityContext/fsGroup; graceful shutdown behavior (SIGTERM finishes the current run, .part discipline makes even SIGKILL safe); link to the spec at `docs/superpowers/specs/2026-07-09-seestar-nas-sync-design.md`.
 
 - [ ] **Step 5: Commit**
 
