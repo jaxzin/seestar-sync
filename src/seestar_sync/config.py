@@ -36,7 +36,8 @@ def _number(env: Mapping[str, str], key: str, default: str, cast) -> float | int
 
 
 def _http_url(env: Mapping[str, str], key: str) -> str | None:
-    """Webhook URLs must be http(s): urllib would happily open file:// etc."""
+    """Outbound reporter URLs (Kuma push, HA webhook) must be http(s):
+    urllib would happily open file:// etc."""
     url = env.get(key, "").strip()
     if not url:
         return None

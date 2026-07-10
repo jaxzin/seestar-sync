@@ -35,8 +35,9 @@ for in-app browsing are never touched, and never even reachable by the deleter.
 ## Rollout sequence
 
 `docker-compose.yml` defaults `DRY_RUN` to `true`. Leave it there for the first several
-days: the daemon will log what it *would* copy and delete, and write the same plan into
-`status.json`, without touching the device or the archive. Review the logs and
+days: the daemon will log every file it *would* copy and delete, and write the planned
+totals into `status.json`, without touching the device or the archive. (The per-file
+plan appears only in the logs; `status.json` carries the counts.) Review the logs and
 `status.json` across a few runs — especially the reclaim side, since deletes are
 one-way — then set `DRY_RUN=false` in `.env` and restart. Reclaim behavior should be the
 last thing you trust, not the first.
@@ -100,7 +101,7 @@ thereafter (it's a no-op if the sentinel already exists).
 ## Reclaim tiers
 
 When device usage crosses `RECLAIM_TRIGGER_PERCENT`, the reclaim pass deletes
-device-original files — always from folders already verified copied to the NAS, oldest
+device-original files — only files individually verified as copied to the NAS, oldest
 session first — until usage drops to `RECLAIM_TARGET_PERCENT`, working through tiers in
 order:
 

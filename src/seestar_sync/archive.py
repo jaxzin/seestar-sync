@@ -8,6 +8,9 @@ Safety properties (spec §Error handling):
   dropped SMB mount (empty dir) can never masquerade as the archive.
 - Torn-write immunity: copies land as .part, are re-read and verified
   (size + sha256), then atomically renamed. The archive never holds a torn file.
+- Path containment: dest_path() treats device filenames as untrusted input and
+  rejects anything that would escape <root>/MyWorks (absolute paths, "..",
+  backslashes), so a hostile or malformed name can't write outside the mirror.
 """
 
 from __future__ import annotations
@@ -82,7 +85,10 @@ class Archive:
             or ".." in pure.parts
             or not (base / pure).resolve().is_relative_to(base.resolve())
         ):
-            raise ArchiveError(f"unsafe device path rejected: {device_path!r}")
+            raise ArchiveError(
+                f"unsafe device path rejected: {device_path!r} — would escape "
+                "the archive mirror (hostile or malformed device filename)"
+            )
         return base / pure
 
     def write_stream(
