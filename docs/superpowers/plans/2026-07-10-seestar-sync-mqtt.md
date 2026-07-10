@@ -717,6 +717,54 @@ def test_command_round_trip_and_invalid_payloads(tmp_path):
     assert store.load()["seestar_host"] == "scope2.local"
 
 
+def test_phase_change_publishes_immediately(tmp_path):
+    # spec: phase changes bypass the throttle
+    rep, fake, clock, *_ = make(tmp_path)
+    rep.start()
+    fake.published.clear()
+    rep.handle_progress(ProgressEvent(phase="copying", files_total=2, bytes_total=20))
+    rep.handle_progress(ProgressEvent(phase="reclaiming", files_total=1, bytes_total=5))
+    prog = [p for p in fake.published if p[0] == "seestar-sync/progress"]
+    assert len(prog) == 2  # both published despite <10s gap
+    assert ("seestar-sync/state", "reclaiming", True) in fake.published
+
+
+def test_reconnect_republishes_discovery_and_settings(tmp_path):
+    # HA/broker restart safety: on_connect fires again → full republish
+    rep, fake, *_ = make(tmp_path)
+    rep.start()
+    fake.published.clear()
+    fake.on_connect(fake, None, None, 0, None)
+    disc = [t for (t, _, _) in fake.published if t.startswith(DISCOVERY_PREFIX)]
+    assert f"{DISCOVERY_PREFIX}/sensor/seestar-sync/state/config" in disc
+    assert ("seestar-sync/availability", "online", True) in fake.published
+    assert ("seestar-sync/settings/dry_run", "OFF", True) in fake.published
+
+
+def test_invalid_host_command_rejected_and_reechoed(tmp_path):
+    rep, fake, _, config, store = make(tmp_path)
+    rep.start()
+    fake.published.clear()
+
+    class Msg:
+        def __init__(self, topic, payload):
+            self.topic = topic
+            self.payload = payload
+
+    fake.on_message(fake, None, Msg("seestar-sync/set/seestar_host", b""))
+    assert "seestar_host" not in store.load()
+    assert ("seestar-sync/settings/seestar_host", "seestar.local", True) in fake.published
+
+
+def test_stop_publishes_offline_retained(tmp_path):
+    # LWT only fires on UNGRACEFUL death; clean shutdown must publish offline
+    rep, fake, *_ = make(tmp_path)
+    rep.start()
+    fake.published.clear()
+    rep.stop()
+    assert ("seestar-sync/availability", "offline", True) in fake.published
+
+
 def test_publish_summary_retains_and_never_raises(tmp_path):
     rep, fake, _, config, store = make(tmp_path)
     rep.start()
@@ -935,9 +983,10 @@ class MqttReporter:
                 return
             from .syncrun import iso
 
+            old = self._store.load().get(key, "<unset>")
             self._store.set(key, value, iso(time.time()))
-            log.warning("settings override via MQTT: %s=%s (applies next pass)",
-                        key, value)
+            log.warning("settings override via MQTT: %s: %s -> %s (applies next pass)",
+                        key, old, value)
             self._echo_current(key)
         except Exception as e:  # noqa: BLE001
             log.warning("mqtt command handling failed (non-fatal): %s", self._redact(e))
@@ -1053,7 +1102,7 @@ def _version() -> str:
 - [ ] **Step 5: Run tests**
 
 Run: `uv run pytest tests/test_mqtt.py -v`
-Expected: 5 passed. Full suite green.
+Expected: 9 passed. Full suite green.
 
 - [ ] **Step 6: Commit**
 
@@ -1108,6 +1157,55 @@ def test_status_shows_setting_sources(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "reclaim_enabled: True (mqtt override)" in out
     assert "dry_run: False (env)" in out
+
+
+def test_mqtt_reclaim_override_arms_and_disarms_deletion(tmp_path):
+    # the highest-blast-radius HA write, end-to-end in BOTH directions
+    from seestar_sync.settings import SettingsStore
+
+    d = FakeDevice(capacity=1000)
+    d.put("M 81_sub/Light_a_20250101-000000.fit", b"x" * 800, mtime=1.0)  # 80%
+    assert run_cli(tmp_path, "run", "--init", device=d) == 0
+    assert len(d.list_files()) == 1  # env default: reclaim off, file survives
+    store = SettingsStore(tmp_path / "archive" / ".seestar-sync" / "settings.json")
+    store.set("reclaim_enabled", True, "2026-07-10T00:00:00Z")
+    assert run_cli(tmp_path, "run", device=d) == 0
+    assert d.list_files() == []  # armed via MQTT override → really deleted
+
+    store.set("reclaim_enabled", False, "2026-07-10T01:00:00Z")
+    d.put("M 81_sub/Light_b_20250102-000000.fit", b"y" * 800, mtime=2.0)
+    assert run_cli(tmp_path, "run", device=d, extra_env={"RECLAIM_ENABLED": "true"}) == 0
+    assert len(d.list_files()) == 1  # override False beats env true → survives
+
+
+def test_mid_pass_override_does_not_half_apply(tmp_path):
+    # spec §Testing: effective config is a per-pass SNAPSHOT — an override
+    # written mid-pass (as the MQTT thread would) never half-applies
+    from seestar_sync.settings import SettingsStore
+
+    store_box = {}
+
+    class FlippingDevice(FakeDevice):
+        def open_read(self, path):
+            if not store_box.get("flipped"):
+                store_box["flipped"] = True
+                store_box["store"].set("dry_run", True, "2026-07-10T00:00:00Z")
+            return super().open_read(path)
+
+    d = FlippingDevice()
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * 4, mtime=1.0)
+    d.put("B_sub/Light_b_20250102-000000.fit", b"b" * 4, mtime=2.0)
+    store_box["store"] = SettingsStore(
+        tmp_path / "archive" / ".seestar-sync" / "settings.json"
+    )
+    assert run_cli(tmp_path, "run", "--init", device=d) == 0
+    # flip happened after file A's read, yet BOTH files really copied
+    assert (tmp_path / "archive" / "MyWorks" / "B_sub"
+            / "Light_b_20250102-000000.fit").exists()
+    d.put("C_sub/Light_c_20250103-000000.fit", b"c" * 4, mtime=3.0)
+    assert run_cli(tmp_path, "run", device=d) == 0
+    assert not (tmp_path / "archive" / "MyWorks" / "C_sub"
+                / "Light_c_20250103-000000.fit").exists()  # next pass: dry run
 
 
 def test_third_party_loggers_quieted(tmp_path):
@@ -1217,7 +1315,7 @@ In `_cmd_status`, after the existing prints, add:
 - [ ] **Step 4: Run tests**
 
 Run: `uv run pytest tests/test_cli.py -v`
-Expected: 15 passed. Full suite green.
+Expected: 17 passed. Full suite green.
 
 - [ ] **Step 5: Commit**
 
