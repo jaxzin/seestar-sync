@@ -1,3 +1,5 @@
+import pytest
+
 from seestar_sync.manifest import Manifest
 
 
@@ -32,6 +34,25 @@ def test_mark_deleted_is_audited(tmp_path):
         assert row.deleted_tier == 1
         # deletion audit does not un-verify the file
         assert m.verified_ok("a.fit", 100, 1000.0)
+
+
+def test_mark_deleted_without_row_refuses(tmp_path):
+    # write-ahead audit must be self-enforcing, not caller-dependent
+    with make(tmp_path) as m:
+        with pytest.raises(LookupError, match="no manifest row"):
+            m.mark_deleted("ghost.fit", tier=1, deleted_at="2026-07-09T02:00:00Z")
+
+
+def test_recopy_clears_delete_audit(tmp_path):
+    # load-bearing for false-delete reconciliation: a re-verified file must
+    # shed its stale delete audit
+    with make(tmp_path) as m:
+        m.record_verified("a.fit", 100, 1000.0, "abc", "2026-07-09T00:00:00Z")
+        m.mark_deleted("a.fit", tier=1, deleted_at="2026-07-09T01:00:00Z")
+        m.record_verified("a.fit", 100, 1000.0, "abc", "2026-07-09T02:00:00Z")
+        row = m.get("a.fit")
+        assert row.deleted_from_device_at is None
+        assert row.deleted_tier is None
 
 
 def test_failure_counter(tmp_path):

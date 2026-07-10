@@ -89,11 +89,20 @@ class Manifest:
         )
 
     def mark_deleted(self, path: str, tier: int, deleted_at: str) -> None:
-        """Write-ahead audit: MUST be committed before the SMB delete is issued."""
-        self._conn.execute(
+        """Write-ahead audit: MUST be committed before the SMB delete is issued.
+
+        Self-enforcing: refuses to audit a path with no manifest row, so a
+        caller that skipped verification cannot produce an unrecorded delete.
+        """
+        cur = self._conn.execute(
             "UPDATE files SET deleted_from_device_at = ?, deleted_tier = ? WHERE path = ?",
             (deleted_at, tier, path),
         )
+        if cur.rowcount == 0:
+            raise LookupError(
+                f"refusing to audit deletion of {path!r}: no manifest row — "
+                "deleting a file without a verified-copy record is forbidden"
+            )
         self._conn.commit()
 
     def bump_failure(self, path: str) -> int:

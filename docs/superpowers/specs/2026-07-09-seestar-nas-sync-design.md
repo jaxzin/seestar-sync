@@ -183,7 +183,10 @@ A firmware rename therefore fails safe (nothing deleted), never catastrophic.
 1. **Tier 1 — RAW subs:** files in `*_sub` folders, oldest session first
    (timestamp parsed from filename; folder mtime fallback). Emptied `_sub`
    folders are removed.
-2. **Tier 2 — videos:** `.avi` / `.mp4` in solar-system folders, oldest first.
+2. **Tier 2 — videos:** any `.avi` / `.mp4` outside `_sub` folders, oldest
+   first. (In practice these live in solar-system folders; the tier is
+   defined by media type, not folder name, to avoid coupling to firmware
+   folder naming. User-ratified 2026-07-09.)
 3. **Tier 3 — stacked FITs:** `*Stacked*.fit` in target folders, oldest
    first. The `.jpg` + `_thn.jpg` browsing triplet remnants always remain.
 
