@@ -3056,7 +3056,19 @@ Expected: `archive error: ... does not exist — is the volume mounted?` (or the
 
 - [ ] **Step 4: Write `README.md`**
 
-Content requirements (write actual prose, not headings-only): what the tool does (one paragraph, mention keeping stacked JPGs on-device); quick start on a Mac (create `.env` with `SEESTAR_HOST`, `ARCHIVE_HOST_PATH`; mount the NAS share in Finder first; `docker compose up -d`); the first-run `--init` step (`docker compose run --rm seestar-sync run --init`); the rollout sequence (DRY_RUN=true → review logs/`status.json` → DRY_RUN=false); full env-var table copied from the spec §Operator interface; CLI subcommands and exit codes; how reclaim tiers work and what is never deleted (stacked JPGs/thumbnails); why the container runs as root by default (archive volume ownership varies across Mac SMB mounts and NAS bind mounts) and that k8s should use securityContext/fsGroup; graceful shutdown behavior (SIGTERM finishes the current run, .part discipline makes even SIGKILL safe); link to the spec at `docs/superpowers/specs/2026-07-09-seestar-nas-sync-design.md`.
+Content requirements (write actual prose, not headings-only — every item below came from an oversight reviewer and will be verified against the implemented surface, not the spec's phrasing):
+
+- What the tool does (one paragraph, mention keeping stacked JPGs on-device for in-app browsing).
+- Quick start on a Mac: create `.env` with `SEESTAR_HOST`, `ARCHIVE_HOST_PATH`; mount the NAS share in Finder first; `docker compose up -d`; first-run `--init` via `docker compose run --rm seestar-sync run --init`.
+- The rollout sequence: DRY_RUN=true for several days → review logs + `status.json` deletion plans → DRY_RUN=false, reclaim graduates last.
+- Full env-var table matching `config.py` actuals (including validation behavior: positive intervals, http(s)-only webhook URLs, LOG_LEVEL allowlist).
+- CLI subcommands + exit codes as implemented (0 ok/skipped_unreachable, 1 partial/error, 2 config/archive). Show `status` invoked via `docker compose run --rm seestar-sync status` or `exec` — it requires SEESTAR_HOST in env, so a bare host-side invocation surprises (tech-writer advisory). Describe `status` as reading `status.json` (what it actually does — not the spec's "status.json + manifest" phrasing).
+- How reclaim tiers work; what is never deleted (stacked JPGs/thumbnails, unknown types); note Tier 2 is any `.avi`/`.mp4` outside `_sub` folders — deliberately broader than "solar-system folders", media-type-defined to avoid firmware folder-name coupling (user-ratified).
+- Free-space measurement: primary SMB query; if firmware doesn't support it, runs go `partial` with "free space unmeasurable" until `DEVICE_CAPACITY_GB` is set (e.g. 128 for the S30 Pro) — document this operator experience explicitly.
+- Why the container runs as root by default (archive volume ownership varies across Mac SMB mounts and NAS bind mounts); k8s should use securityContext/fsGroup.
+- Graceful shutdown honestly stated: SIGTERM finishes the current FILE (not the whole run) then exits; even SIGKILL is safe thanks to `.part` discipline; the sentinel/foreign-storage guards re-check before every pass.
+- Monitoring: Kuma push only on ok/skipped_unreachable (silence = alert), HA webhook payload = status.json shape, monthly JSONL history.
+- Link to the spec at `docs/superpowers/specs/2026-07-09-seestar-nas-sync-design.md`.
 
 - [ ] **Step 5: Commit**
 
