@@ -296,6 +296,12 @@ class Config:
             # a zero/negative window would silently disable it
             raise ConfigError(f"ACTIVE_WINDOW_MINUTES must be >= 1, got {window}")
 
+        log_level = env.get("LOG_LEVEL", "INFO").upper()
+        if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            raise ConfigError(
+                f"LOG_LEVEL must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL, got {log_level!r}"
+            )
+
         return cls(
             seestar_host=host,
             archive_dir=Path(env.get("ARCHIVE_DIR", "/archive")),
@@ -308,7 +314,7 @@ class Config:
             ha_webhook_url=_http_url(env, "HA_WEBHOOK_URL"),
             dry_run=_bool(env, "DRY_RUN"),
             archive_on_root_fs_ok=_bool(env, "ARCHIVE_ON_ROOT_FS_OK"),
-            log_level=env.get("LOG_LEVEL", "INFO").upper(),
+            log_level=log_level,
         )
 ```
 
@@ -2207,6 +2213,12 @@ def test_run_with_errors_is_exit_1(tmp_path):
     assert run_cli(tmp_path, "run", "--init", device=d) == 1
 
 
+def test_bad_log_level_is_exit_2(tmp_path):
+    # SDET finding: logging.basicConfig raises ValueError on unknown levels;
+    # that must surface as a config error (exit 2), not a traceback
+    assert run_cli(tmp_path, "run", "--init", extra_env={"LOG_LEVEL": "banana"}) == 2
+
+
 def test_status_subcommand(tmp_path, capsys):
     d = FakeDevice()
     run_cli(tmp_path, "run", "--init", device=d)
@@ -2232,6 +2244,8 @@ def test_rebuild_manifest(tmp_path):
 
 Run: `uv run pytest tests/test_cli.py -v`
 Expected: FAIL — `ModuleNotFoundError`
+
+Cross-file note for this task's implementer: the `LOG_LEVEL` validation shown in plan Task 1's `Config.from_env` was added after Batch A shipped (SDET finding). If `src/seestar_sync/config.py` doesn't yet validate `LOG_LEVEL` against DEBUG/INFO/WARNING/ERROR/CRITICAL, add that block (and a `test_bad_log_level_is_fatal` ConfigError test in `tests/test_config.py`) as part of this task, TDD as usual — the CLI test below depends on it.
 
 - [ ] **Step 3: Implement `src/seestar_sync/cli.py`**
 
