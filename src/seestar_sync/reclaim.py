@@ -47,7 +47,8 @@ def plan_reclaim(
             continue  # never delete without a verified NAS copy
         candidates.append(Deletion(f, tier))
 
-    candidates.sort(key=lambda d: (d.tier, session_key(d.file)))
+    # path tiebreaker keeps deletion plans deterministic when timestamps tie
+    candidates.sort(key=lambda d: (d.tier, session_key(d.file), d.file.path))
 
     plan: list[Deletion] = []
     freed = 0
