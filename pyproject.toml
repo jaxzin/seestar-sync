@@ -5,7 +5,10 @@ description = "Mirror Seestar S30 Pro media to a NAS over SMB and reclaim device
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["smbprotocol>=1.13,<2"]
+dependencies = [
+    "paho-mqtt>=2,<3",
+    "smbprotocol>=1.13,<2",
+]
 
 [project.scripts]
 seestar-sync = "seestar_sync.cli:entrypoint"
