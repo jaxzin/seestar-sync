@@ -1011,7 +1011,7 @@ class Archive:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_archive.py -v`
-Expected: 5 passed
+Expected: 6 passed
 
 - [ ] **Step 5: Commit**
 
