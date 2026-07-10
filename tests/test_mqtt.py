@@ -37,8 +37,13 @@ class FakeClient:
     def disconnect(self):
         pass
 
+    class _MsgInfo:
+        def wait_for_publish(self, timeout=None):
+            pass
+
     def publish(self, topic, payload=None, qos=0, retain=False):
         self.published.append((topic, payload, retain))
+        return self._MsgInfo()
 
     def subscribe(self, topic, qos=0):
         self.subscribed.append(topic)
@@ -60,7 +65,7 @@ def make(tmp_path, **env_over):
     store = SettingsStore(tmp_path / "settings.json")
     fake = FakeClient()
     clock = FakeClock()
-    rep = MqttReporter(config, store, client_factory=lambda: fake, clock=clock)
+    rep = MqttReporter(config, store, client_factory=lambda *a: fake, clock=clock)
     return rep, fake, clock, config, store
 
 
@@ -82,14 +87,21 @@ def test_start_publishes_discovery_availability_and_settings(tmp_path):
     assert f"{DISCOVERY_PREFIX}/switch/seestar-sync/dry_run/config" in disc
     assert f"{DISCOVERY_PREFIX}/switch/seestar-sync/reclaim_enabled/config" in disc
     assert f"{DISCOVERY_PREFIX}/text/seestar-sync/seestar_host/config" in disc
-    # every discovery payload shares the device block + availability topic
+    assert f"{DISCOVERY_PREFIX}/binary_sensor/seestar-sync/online/config" in disc
+    assert f"{DISCOVERY_PREFIX}/sensor/seestar-sync/version/config" in disc
+    # every discovery payload shares the device block; all but the liveness
+    # binary_sensor also share the availability topic (it must not grey
+    # itself out via the topic it reports)
     for topic, payload, retain in fake.published:
         if topic.startswith(DISCOVERY_PREFIX):
             body = json.loads(payload)
             assert retain is True
-            assert body["availability_topic"] == "seestar-sync/availability"
             assert body["device"]["identifiers"] == ["seestar-sync"]
             assert "unique_id" in body
+            if topic.endswith("/online/config"):
+                assert "availability_topic" not in body
+            else:
+                assert body["availability_topic"] == "seestar-sync/availability"
     # command subscriptions
     assert "seestar-sync/set/dry_run" in fake.subscribed
     assert "seestar-sync/set/reclaim_enabled" in fake.subscribed
@@ -188,6 +200,13 @@ def test_invalid_host_command_rejected_and_reechoed(tmp_path):
     assert "seestar_host" not in store.load()
     assert ("seestar-sync/settings/seestar_host", "seestar.local", True) in fake.published
 
+    # nonempty-but-invalid host: the strict validator rejects at store.set;
+    # HA must still snap back (targeted rejection path, not the generic guard)
+    fake.published.clear()
+    fake.on_message(fake, None, Msg("seestar-sync/set/seestar_host", b"bad host"))
+    assert "seestar_host" not in store.load()
+    assert ("seestar-sync/settings/seestar_host", "seestar.local", True) in fake.published
+
 
 def test_stop_publishes_offline_retained(tmp_path):
     # LWT only fires on UNGRACEFUL death; clean shutdown must publish offline
@@ -215,11 +234,44 @@ def test_publish_summary_retains_and_never_raises(tmp_path):
     rep.publish_summary(summary, effective, sources)  # must not raise
 
 
+def test_guard_warnings_fire_and_redact_readably(tmp_path, caplog):
+    # SDET: never-raise tests must assert the warning FIRED (a silent no-op
+    # can't masquerade as a caught failure), the secret is gone, and short
+    # non-secrets (username "u") don't turn the message into soup
+    import logging
+
+    from seestar_sync.settings import resolve_effective
+
+    rep, fake, _, config, store = make(tmp_path, MQTT_PASSWORD="hunter2secret")
+    rep.start()
+
+    def explode(*a, **k):
+        raise OSError("auth failed for hunter2secret while connecting")
+
+    fake.publish = explode
+    with caplog.at_level(logging.WARNING):
+        rep.publish_settings(*resolve_effective(config, store))
+    assert "settings publish failed" in caplog.text  # guard observably fired
+    assert "hunter2secret" not in caplog.text
+    assert "<redacted>" in caplog.text
+    assert "auth failed" in caplog.text  # username "u" didn't mangle the words
+
+
+def test_progress_percent_zero_total(tmp_path):
+    # division guard: a zero-byte plan must publish 0.0, not die silently
+    rep, fake, clock, *_ = make(tmp_path)
+    rep.start()
+    fake.published.clear()
+    rep.handle_progress(ProgressEvent(phase="done"))
+    prog = [p for p in fake.published if p[0] == "seestar-sync/progress"]
+    assert json.loads(prog[-1][1])["percent"] == 0.0
+
+
 def test_disabled_without_mqtt_host(tmp_path):
     env = {"SEESTAR_HOST": "seestar.local"}
     config = Config.from_env(env)
     store = SettingsStore(tmp_path / "settings.json")
-    rep = MqttReporter(config, store, client_factory=lambda: FakeClient())
+    rep = MqttReporter(config, store, client_factory=lambda *a: FakeClient())
     rep.start()  # no-op, no client created
     rep.handle_progress(ProgressEvent(phase="copying"))
     rep.stop()  # all safe no-ops

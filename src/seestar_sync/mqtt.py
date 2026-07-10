@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 THROTTLE_SECONDS = 10.0
 DISCOVERY_PREFIX = "homeassistant"
+_MIN_REDACT_LEN = 4  # shorter "secrets" (e.g. username "u") aren't secrets
 
 _PHASE_TO_STATE = {
     "listing": "listing",
@@ -30,12 +31,12 @@ _PHASE_TO_STATE = {
 }
 
 
-def _paho_factory():
+def _paho_factory(client_id: str):
     import paho.mqtt.client as paho
 
     return paho.Client(
         callback_api_version=paho.CallbackAPIVersion.VERSION2,
-        client_id="seestar-sync",
+        client_id=client_id,
     )
 
 
@@ -62,7 +63,9 @@ class MqttReporter:
         if not self._config.mqtt_host:
             return  # feature disabled: v0.1 behavior
         try:
-            client = self._factory()
+            # client_id derives from the prefix so a second scope (different
+            # MQTT_TOPIC_PREFIX) doesn't kick this one off the broker
+            client = self._factory(self._prefix)
             if self._config.mqtt_username:
                 client.username_pw_set(
                     self._config.mqtt_username, self._config.mqtt_password
@@ -71,9 +74,8 @@ class MqttReporter:
             client.on_message = self._on_message
             client.will_set(self._topic("availability"), "offline", retain=True)
             client.connect_async(self._config.mqtt_host, self._config.mqtt_port)
-            # Assign before loop_start(): paho may fire on_connect from its
-            # network thread as soon as the loop starts, and the callbacks
-            # publish via self._client.
+            # assign BEFORE loop_start: paho's network thread can fire
+            # on_connect immediately, and the callbacks publish via self._client
             self._client = client
             client.loop_start()  # paho reconnects automatically from here on
         except Exception as e:  # noqa: BLE001 — reporter must never raise
@@ -84,15 +86,26 @@ class MqttReporter:
         if self._client is None:
             return
         try:
-            self._publish("availability", "offline", retain=True)
-            self._client.loop_stop()
+            # Canonical paho shutdown order. loop_stop-first would kill the
+            # network thread with the offline packet still queued; the clean
+            # DISCONNECT then suppresses LWT and HA shows the dead daemon
+            # online forever. Flush the offline publish to the wire first.
+            info = self._client.publish(self._topic("availability"), "offline",
+                                        retain=True)
+            try:
+                info.wait_for_publish(timeout=2.0)
+            except Exception:  # noqa: BLE001 — best-effort flush
+                pass
             self._client.disconnect()
+            self._client.loop_stop()
         except Exception as e:  # noqa: BLE001
             log.warning("mqtt stop failed (non-fatal): %s", self._redact(e))
 
     # ---- publishing ------------------------------------------------------
 
     def handle_progress(self, event: ProgressEvent) -> None:
+        """Observer consumer: phase changes and `done` publish immediately;
+        otherwise ≥ THROTTLE_SECONDS apart (consumer-side throttling per spec)."""
         if self._client is None:
             return
         try:
@@ -174,18 +187,22 @@ class MqttReporter:
                     return
                 value: object = payload == "ON"
             elif key == "seestar_host":
-                if not payload:
-                    log.warning("mqtt: empty seestar_host rejected; re-echoing state")
-                    self._echo_current(key)
-                    return
-                value = payload
+                value = payload  # ALL host validation delegated to the store —
+                # one validation authority (rejects empty/whitespace/control)
             else:
                 log.warning("mqtt: command for unknown key %r ignored", key)
                 return
             from .syncrun import iso
 
             old = self._store.load().get(key, "<unset>")
-            self._store.set(key, value, iso(time.time()))
+            try:
+                self._store.set(key, value, iso(time.time()))
+            except ValueError as e:
+                # validator rejected: targeted warning + re-echo so HA snaps
+                # back — spec §Failure isolation
+                log.warning("mqtt: rejected %s command %r: %s", key, value, e)
+                self._echo_current(key)
+                return
             log.warning("settings override via MQTT: %s: %s -> %s (applies next pass)",
                         key, old, value)
             self._echo_current(key)
@@ -210,31 +227,45 @@ class MqttReporter:
         msg = str(e)
         for secret in (self._config.mqtt_password, self._config.mqtt_username,
                        self._config.mqtt_host):
-            if secret and secret in msg:
+            # replacing ultra-short substrings turns messages into soup
+            # ("a<redacted>th failed") without hiding anything meaningful
+            if secret and len(secret) >= _MIN_REDACT_LEN and secret in msg:
                 msg = msg.replace(secret, "<redacted>")
         return msg
 
     def _publish_discovery(self) -> None:
         device = {
-            "identifiers": ["seestar-sync"],
+            "identifiers": [self._prefix],  # prefix-derived: second scopes coexist
             "name": "Seestar Sync",
             "manufacturer": "seestar-sync",
             "sw_version": _version(),
         }
 
-        def entity(component: str, object_id: str, extra: dict) -> None:
+        def entity(component: str, object_id: str, extra: dict,
+                   with_availability: bool = True) -> None:
             body = {
-                "unique_id": f"seestar-sync_{object_id}",
-                "availability_topic": self._topic("availability"),
+                "unique_id": f"{self._prefix}_{object_id}",
                 "device": device,
                 **extra,
             }
+            if with_availability:
+                body["availability_topic"] = self._topic("availability")
             self._client.publish(
                 f"{DISCOVERY_PREFIX}/{component}/{self._prefix}/{object_id}/config",
                 json.dumps(body), retain=True,
             )
 
         summary_t = self._topic("summary")
+        # the alertable liveness entity (spec: "Daemon online" binary_sensor)
+        # reads the availability topic directly, so it must NOT grey itself
+        # out via that same topic — with_availability=False
+        entity("binary_sensor", "online", {
+            "name": "Daemon online",
+            "state_topic": self._topic("availability"),
+            "payload_on": "online",
+            "payload_off": "offline",
+            "device_class": "connectivity",
+        }, with_availability=False)
         entity("sensor", "state", {"name": "State", "state_topic": self._topic("state")})
         entity("sensor", "progress", {
             "name": "Progress", "unit_of_measurement": "%",
@@ -252,7 +283,7 @@ class MqttReporter:
             "json_attributes_topic": summary_t,
         })
         entity("sensor", "last_run", {
-            "name": "Last run", "device_class": "timestamp",
+            "name": "Last run time", "device_class": "timestamp",
             "state_topic": summary_t,
             "value_template": "{{ value_json.last_run }}",
         })
@@ -261,11 +292,15 @@ class MqttReporter:
             ("bytes_copied", "Bytes copied", "{{ value_json.bytes_copied }}"),
             ("files_deleted", "Files deleted", "{{ value_json.files_deleted }}"),
             ("bytes_reclaimed", "Bytes reclaimed", "{{ value_json.bytes_reclaimed }}"),
-            ("errors", "Errors", "{{ value_json.errors | length }}"),
         ):
             entity("sensor", object_id, {
                 "name": name, "state_topic": summary_t, "value_template": template,
             })
+        entity("sensor", "errors", {
+            "name": "Errors", "state_topic": summary_t,
+            "value_template": "{{ value_json.errors | length }}",
+            "json_attributes_topic": summary_t,  # spec: full list as attribute
+        })
         for key, name in (("dry_run", "Dry run"), ("reclaim_enabled", "Reclaim enabled")):
             entity("switch", key, {
                 "name": name,
@@ -283,6 +318,7 @@ class MqttReporter:
             ("sync_interval", "Sync interval (min)", str(self._config.sync_interval_minutes)),
             ("trigger_percent", "Reclaim trigger %", str(self._config.reclaim_trigger_percent)),
             ("target_percent", "Reclaim target %", str(self._config.reclaim_target_percent)),
+            ("version", "Version", _version()),
         ):
             entity("sensor", object_id, {
                 "name": name, "state_topic": self._topic(f"diag/{object_id}"),
