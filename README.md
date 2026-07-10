@@ -74,7 +74,11 @@ under Docker, `docker compose`, or a bare `uv run seestar-sync`).
 | `ACTIVE_WINDOW_MINUTES` | `15` | Per-folder session guard: a top-level folder with any write inside this window is skipped for both copy and reclaim. Must be `>= 1` — it's a delete-safety feature and can't be disabled. |
 | `DEVICE_CAPACITY_GB` | *(unset)* | Fallback total capacity, in GB, used only if the device won't answer a free-space query (see below). Must be a positive number if set. |
 | `KUMA_PUSH_URL` | *(unset)* | Uptime Kuma push-monitor URL. Must be `http://` or `https://` if set. |
-| `HA_WEBHOOK_URL` | *(unset)* | Home Assistant webhook URL. Must be `http://` or `https://` if set. |
+| `MQTT_HOST` | *(unset)* | Home Assistant MQTT broker host. Unset disables MQTT entirely (byte-for-byte v0.1 behavior). Only meaningful in `daemon` mode. |
+| `MQTT_PORT` | `1883` | Broker port. Must be `1`-`65535`. |
+| `MQTT_USERNAME` | *(unset)* | Broker username. Required if `MQTT_HOST` is set — anonymous brokers are not supported (see Security note). |
+| `MQTT_PASSWORD` | *(unset)* | Broker password. **Secret** — `.env` only, never logged, never in `status.json`/history. Required if `MQTT_USERNAME` is set. |
+| `MQTT_TOPIC_PREFIX` | `seestar-sync` | Topic namespace and HA device identifier. Must be a single topic segment (no `/ # +`) — set a different value per scope if you run more than one instance against the same broker. |
 | `DRY_RUN` | `false` | Accepts `1`/`true`/`yes`/`on` (true) or `0`/`false`/`no`/`off`/empty (false); anything else is a fatal config error. Plans copies/deletes but performs neither. |
 | `ARCHIVE_ON_ROOT_FS_OK` | `false` | Escape hatch for the foreign-storage guard (see "Why the container runs as root", below, and the graceful-shutdown section for the related sentinel check). Same boolean parsing as `DRY_RUN`. |
 | `LOG_LEVEL` | `INFO` | One of `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL` (case-insensitive); anything else is a fatal config error. |
@@ -176,11 +180,87 @@ silently treated as an empty archive.
 - **Uptime Kuma** — if `KUMA_PUSH_URL` is set, a push is sent only when the run result
   is `ok` or `skipped_unreachable`. Runs with errors deliberately don't ping, so silence
   from Kuma's side is the alert.
-- **Home Assistant** — if `HA_WEBHOOK_URL` is set, every run POSTs the same JSON shape
-  as `status.json` to that webhook, regardless of result.
+- **Home Assistant (MQTT)** — if `MQTT_HOST` is set (daemon mode only), the daemon
+  publishes live progress and per-run summaries as an MQTT-discovered device, and
+  accepts writable settings back from HA. See "Home Assistant (MQTT)" below.
 
 All reporters are fire-and-forget: a reporter failure (network error, bad URL, etc.) is
 logged as a warning and never affects the run's exit code.
+
+Third-party protocol libraries (`smbprotocol`, `spnego`, `paho`) are quieted to
+`WARNING` regardless of `LOG_LEVEL`, since their per-packet chatter at `INFO`/`DEBUG`
+drowns the operator-facing log narrative. Set `LOG_LEVEL=DEBUG` to re-enable their
+verbose logging when debugging the SMB or MQTT wire protocol directly.
+
+## Home Assistant (MQTT)
+
+Setting `MQTT_HOST` (daemon mode only) makes `seestar-sync` appear in Home Assistant
+as an MQTT-discovered device named **Seestar Sync**, with live progress and writable
+runtime settings. Prerequisite: an MQTT broker HA can see — typically the Mosquitto
+add-on — and a dedicated MQTT user for this tool (see Security note below; **do not**
+point `MQTT_HOST` at an anonymous/unauthenticated broker).
+
+### Entities
+
+18 entities are published under the device, split across the areas HA groups by:
+
+**Live state**
+- **Daemon online** (`binary_sensor`) — the alertable liveness signal, driven by MQTT's
+  Last Will (LWT): if the daemon dies (crash, `docker stop`, `SIGKILL`, network drop)
+  without a clean disconnect, the broker flips this off automatically, and every other
+  entity greys out in HA because they share the same availability topic. Uptime Kuma
+  remains the independent, MQTT-broker-agnostic alarm — losing MQTT doesn't lose your
+  alerting.
+- **State** — `listing` / `copying` / `reclaiming` / `idle` / `unreachable` / `error`.
+- **Progress** (%) — updated at most once every 10 seconds while a phase is in
+  progress; a *phase change* (e.g. `copying` → `reclaiming`) always publishes
+  immediately regardless of the throttle. Attributes include file/byte counts and the
+  current file path.
+- **Device fill level** (%)
+
+**Last run**
+- **Last run result**, **Last run time**, **Files copied**, **Bytes copied**,
+  **Files deleted**, **Bytes reclaimed**, **Errors**
+
+**Settings (writable, config category)**
+- **Dry run** (switch), **Reclaim enabled** (switch), **Seestar host** (text)
+
+**Diagnostics**
+- **Sync interval (min)**, **Reclaim trigger %**, **Reclaim target %**, **Version**
+
+### Settings semantics
+
+The three writable entities (**Dry run**, **Reclaim enabled**, **Seestar host**) are
+overrides, not live config edits:
+
+- A change from HA is written to `.seestar-sync/settings.json` in the archive's
+  metadata directory and takes effect at the **start of the next pass** — never
+  mid-pass, so a change made while a copy is running can't half-apply.
+- Precedence is **override > env default**, resolved once per pass into a snapshot.
+  An override survives daemon restarts (it's a file, not in-memory state); to go back
+  to the env-var value, clear it from HA (there's no "unset" gesture from the switch/text
+  UI today — edit `settings.json` directly, or redeploy with the override key removed).
+- `seestar-sync status` shows both the effective value and where it came from, e.g.:
+
+  ```
+  settings:
+    dry_run: True (mqtt override)
+    reclaim_enabled: False (env)
+    seestar_host: seestar.local (env)
+  ```
+
+  (Python's native `True`/`False` — the CLI prints the values verbatim, not
+  HA's `ON`/`OFF` strings.) The `settings:` block only appears once a run has produced
+  `status.json` — `seestar-sync status` prints "no status yet" before the first run.
+- **Watch out**: a plausible-but-wrong **Seestar host** override (e.g. a typo, or a
+  stale IP after a DHCP lease change) doesn't surface as a settings error — the pass
+  simply can't reach the device, and HA shows the **State** sensor stuck at
+  `unreachable`. If sync looks stalled, check the **Seestar host** entity's source
+  (`mqtt override` vs `env`) before suspecting the telescope itself.
+- The **done** event that closes every pass (and the summary it drives) carries
+  **copy totals only** — `files_copied`/`bytes_copied`, not reclaim counts. Reclaim
+  totals (`files_deleted`/`bytes_reclaimed`) are only present in the **Last run**
+  summary entities, not in the live **Progress** attributes.
 
 ## Security note
 
@@ -190,6 +270,19 @@ tool. This tool's SMB transfers are unsigned, because guest sessions cryptograph
 cannot sign (a device design constraint, not a configuration choice), so file integrity
 in transit is only as trustworthy as the network itself. Keep the telescope on a trusted
 network or its own VLAN.
+
+MQTT broker credentials are effectively **admin credentials for this tool**, not just a
+monitoring feed: the command topics let anyone who can publish to them arm deletion
+(`Reclaim enabled` ON), disarm dry-run (`Dry run` OFF), and redirect the sync target to
+an arbitrary host (`Seestar host`) — full control over what gets copied, what gets
+deleted, and where from. Always set `MQTT_USERNAME`/`MQTT_PASSWORD` and point
+`MQTT_HOST` at an authenticated broker — never an anonymous/open one. (Config
+validation enforces internal consistency — a username implies a host, a password
+implies a username — but does not itself require a broker to demand auth; the
+anonymous-broker prohibition is an operational requirement, not a startup check.)
+Treat broker compromise as equivalent to compromising this tool directly.
+`MQTT_PASSWORD` is a secret like the Kuma push URL: it belongs in `.env` only, is never
+written to `status.json`/history, and is redacted from log output even in error paths.
 
 ## Design spec
 

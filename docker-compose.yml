@@ -13,7 +13,11 @@ services:
       ACTIVE_WINDOW_MINUTES: ${ACTIVE_WINDOW_MINUTES:-15}
       DEVICE_CAPACITY_GB: ${DEVICE_CAPACITY_GB:-}   # empty → Config maps to None
       KUMA_PUSH_URL: ${KUMA_PUSH_URL:-}
-      HA_WEBHOOK_URL: ${HA_WEBHOOK_URL:-}
+      MQTT_HOST: ${MQTT_HOST:-}            # unset = MQTT disabled
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_TOPIC_PREFIX: ${MQTT_TOPIC_PREFIX:-seestar-sync}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # ARCHIVE_DIR is fixed at /archive by the image; ARCHIVE_ON_ROOT_FS_OK
       # is deliberately not exposed — it's a dangerous escape hatch that
