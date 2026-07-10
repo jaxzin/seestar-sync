@@ -13,7 +13,8 @@ def summary(result="ok"):
 def test_write_status_snapshot(tmp_path):
     write_status(tmp_path, summary())
     data = json.loads((tmp_path / "status.json").read_text())
-    # exact spec contract — this JSON is also the HA webhook payload
+    # exact spec contract — this JSON is also the MQTT summary payload
+    # (published retained to the summary topic)
     assert set(data) == {
         "last_run", "result", "dry_run", "reclaim_enabled", "files_copied",
         "bytes_copied", "files_deleted", "bytes_reclaimed",

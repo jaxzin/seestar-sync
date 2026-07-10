@@ -101,11 +101,14 @@ def test_mqtt_defaults_and_parse():
         MQTT_HOST="homeassistant.local", MQTT_PORT="1884",
         MQTT_USERNAME="seestar", MQTT_PASSWORD="hunter2",
         MQTT_TOPIC_PREFIX="scope2",
+        KUMA_PUSH_URL="https://kuma.local/api/push/KUMATOKEN123",
     ))
     assert cfg.mqtt_host == "homeassistant.local" and cfg.mqtt_port == 1884
     assert cfg.mqtt_username == "seestar" and cfg.mqtt_password == "hunter2"
     assert cfg.mqtt_topic_prefix == "scope2"
+    # secrets must never leak via tracebacks/logs that repr() a Config
     assert "hunter2" not in repr(cfg)
+    assert "KUMATOKEN123" not in repr(cfg)
 
 
 def test_mqtt_validation_is_fatal():

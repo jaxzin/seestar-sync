@@ -57,7 +57,7 @@ class Config:
     reclaim_target_percent: float
     active_window_minutes: int
     device_capacity_gb: float | None
-    kuma_push_url: str | None
+    kuma_push_url: str | None = dataclasses.field(repr=False)  # push token
     mqtt_host: str | None
     mqtt_port: int
     mqtt_username: str | None
