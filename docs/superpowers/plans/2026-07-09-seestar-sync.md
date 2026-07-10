@@ -2478,6 +2478,12 @@ class SmbDeviceClient:
         self._capacity_bytes = (
             int(capacity_gb * 1024**3) if capacity_gb is not None else None
         )
+        # Live-validated against the real S30 Pro (2026-07-09): its guest
+        # session supports neither SMB signing nor secure-negotiate
+        # verification, so both checks must be relaxed or every connection
+        # fails. Guest-only auth is the device's documented design; the
+        # trust boundary is the LAN. NOTE: ClientConfig is process-global.
+        smbclient.ClientConfig(require_secure_negotiate=False)
         with self._map_errors():
             smbclient.register_session(
                 host,
@@ -2485,6 +2491,7 @@ class SmbDeviceClient:
                 password="",
                 connection_timeout=timeout,
                 auth_protocol="ntlm",
+                require_signing=False,
             )
 
     def _unc(self, rel: str = "") -> str:
