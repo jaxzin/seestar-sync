@@ -19,6 +19,7 @@ from .config import Config, ConfigError
 from .device import DeviceClient
 from .manifest import Manifest
 from .reporters import report_all
+from .settings import OVERRIDE_KEYS, SettingsStore, resolve_effective
 from .syncrun import iso, run_sync
 
 log = logging.getLogger("seestar_sync")
@@ -40,7 +41,8 @@ def _prepare(config: Config, init: bool) -> Archive:
     return archive
 
 
-def _one_run(config: Config, archive: Archive, device_factory, should_stop=None) -> int:
+def _one_run(config: Config, archive: Archive, device_factory,
+             should_stop=None, mqtt=None) -> int:
     # The mount-drop trap is a MID-LIFE event, not just a startup one: in
     # daemon mode the archive volume can vanish between scheduled passes.
     # Re-check before every pass — otherwise Manifest.__init__'s mkdir would
@@ -49,21 +51,32 @@ def _one_run(config: Config, archive: Archive, device_factory, should_stop=None)
     # propagates to main's handler → exit 2 (crash-loud; the restart loop +
     # Kuma silence alert the operator).
     archive.check_ready(allow_root_fs=config.archive_on_root_fs_ok)
+    store = SettingsStore(archive.meta_dir / "settings.json")
+    effective, sources = resolve_effective(config, store)
+    for key in OVERRIDE_KEYS:
+        if sources[key] == "mqtt override":
+            log.warning("effective %s comes from MQTT override", key)
     from .device import DeviceUnavailable
 
+    observer = mqtt.handle_progress if mqtt is not None else None
     try:
-        device = device_factory(config)
+        device = device_factory(effective)
     except DeviceUnavailable:
         from .models import RunSummary
 
         summary = RunSummary(started_at=iso(time.time()), result="skipped_unreachable",
-                             dry_run=config.dry_run,
-                             reclaim_enabled=config.reclaim_enabled)
-        report_all(config, archive.meta_dir, summary)
+                             dry_run=effective.dry_run,
+                             reclaim_enabled=effective.reclaim_enabled)
+        report_all(effective, archive.meta_dir, summary)
+        if mqtt is not None:
+            mqtt.publish_summary(summary, effective, sources)
         return 0
     with Manifest(archive.meta_dir / "manifest.db") as manifest:
-        summary = run_sync(device, archive, manifest, config, should_stop=should_stop)
-    report_all(config, archive.meta_dir, summary)
+        summary = run_sync(device, archive, manifest, effective,
+                           should_stop=should_stop, observer=observer)
+    report_all(effective, archive.meta_dir, summary)
+    if mqtt is not None:
+        mqtt.publish_summary(summary, effective, sources)
     return 0 if summary.result in ("ok", "skipped_unreachable") else 1
 
 
@@ -89,13 +102,27 @@ def _cmd_daemon(config: Config, args, device_factory) -> int:
 
     log.info("daemon: syncing %s every %d min", config.seestar_host,
              config.sync_interval_minutes)
-    while not stop.is_set():
-        # stop.is_set threads through run_sync as should_stop, so a signal
-        # mid-run ends the sync bounded by one file, not one full run
-        code = _one_run(config, archive, device_factory, should_stop=stop.is_set)
-        if code != 0:
-            log.warning("run finished with errors (exit %d); continuing", code)
-        stop.wait(interval)  # interruptible, unlike time.sleep
+
+    from .mqtt import MqttReporter
+
+    store = SettingsStore(archive.meta_dir / "settings.json")
+    mqtt = MqttReporter(config, store) if config.mqtt_host else None
+    if mqtt is not None:
+        mqtt.start()
+    try:
+        while not stop.is_set():
+            # stop.is_set threads through run_sync as should_stop, so a signal
+            # mid-run ends the sync bounded by one file, not one full run
+            code = _one_run(config, archive, device_factory,
+                            should_stop=stop.is_set, mqtt=mqtt)
+            if code != 0:
+                log.warning("run finished with errors (exit %d); continuing", code)
+            stop.wait(interval)  # interruptible, unlike time.sleep
+    finally:
+        # must run even when ArchiveError propagates out of a pass — LWT
+        # otherwise leaves HA showing the dead daemon online forever
+        if mqtt is not None:
+            mqtt.stop()
     return 0
 
 
@@ -118,6 +145,11 @@ def _cmd_status(config: Config, args, device_factory) -> int:
         print(f"active folders skipped: {', '.join(data['active_folders_skipped'])}")
     for err in data.get("errors", []):
         print(f"error: {err}")
+    store = SettingsStore(config.archive_dir / ".seestar-sync" / "settings.json")
+    effective, sources = resolve_effective(config, store)
+    print("settings:")
+    for key in OVERRIDE_KEYS:
+        print(f"  {key}: {getattr(effective, key)} ({sources[key]})")
     return 0
 
 
@@ -182,6 +214,11 @@ def main(
         level=config.log_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    if config.log_level != "DEBUG":
+        # wire chatter (one line per SMB packet) drowns the operator
+        # narrative in docker logs; DEBUG re-enables it for protocol work
+        for noisy in ("smbprotocol", "spnego", "paho"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
     factory = device_factory or _default_device_factory
     try:
         return args.handler(config, args, factory)

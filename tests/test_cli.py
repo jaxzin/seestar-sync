@@ -134,3 +134,101 @@ def test_rebuild_manifest(tmp_path):
         # rows — pin the real recomputed checksum and restored eligibility
         assert row.sha256 == hashlib.sha256(b"data").hexdigest()
         assert m.verified_ok("M 81_sub/Light_a_20250101-000000.fit", 4, 1.0)
+
+
+def test_settings_override_applies_next_pass(tmp_path):
+    # write an override the way MQTT would, then run with a default env:
+    # the pass must honor the override (mode-independent effective config)
+    from seestar_sync.settings import SettingsStore
+
+    d = FakeDevice()
+    d.put("M 81_sub/Light_a_20250101-000000.fit", b"data", mtime=1.0)
+    assert run_cli(tmp_path, "run", "--init", device=d) == 0  # creates meta dir
+    store = SettingsStore(tmp_path / "archive" / ".seestar-sync" / "settings.json")
+    store.set("dry_run", True, "2026-07-10T00:00:00Z")
+    d.put("M 81_sub/Light_b_20250102-000000.fit", b"more", mtime=2.0)
+    assert run_cli(tmp_path, "run", device=d) == 0
+    status = json.loads(
+        (tmp_path / "archive" / ".seestar-sync" / "status.json").read_text()
+    )
+    assert status["dry_run"] is True  # override applied despite env default false
+    # file b not copied (dry run) — archive only has file a
+    assert not (tmp_path / "archive" / "MyWorks" / "M 81_sub"
+                / "Light_b_20250102-000000.fit").exists()
+
+
+def test_status_shows_setting_sources(tmp_path, capsys):
+    from seestar_sync.settings import SettingsStore
+
+    run_cli(tmp_path, "run", "--init")
+    store = SettingsStore(tmp_path / "archive" / ".seestar-sync" / "settings.json")
+    store.set("reclaim_enabled", True, "2026-07-10T00:00:00Z")
+    assert run_cli(tmp_path, "status") == 0
+    out = capsys.readouterr().out
+    assert "reclaim_enabled: True (mqtt override)" in out
+    assert "dry_run: False (env)" in out
+
+
+def test_mqtt_reclaim_override_arms_and_disarms_deletion(tmp_path):
+    # the highest-blast-radius HA write, end-to-end in BOTH directions
+    from seestar_sync.settings import SettingsStore
+
+    d = FakeDevice(capacity=1000)
+    d.put("M 81_sub/Light_a_20250101-000000.fit", b"x" * 800, mtime=1.0)  # 80%
+    assert run_cli(tmp_path, "run", "--init", device=d) == 0
+    assert len(d.list_files()) == 1  # env default: reclaim off, file survives
+    store = SettingsStore(tmp_path / "archive" / ".seestar-sync" / "settings.json")
+    store.set("reclaim_enabled", True, "2026-07-10T00:00:00Z")
+    assert run_cli(tmp_path, "run", device=d) == 0
+    assert d.list_files() == []  # armed via MQTT override → really deleted
+
+    store.set("reclaim_enabled", False, "2026-07-10T01:00:00Z")
+    d.put("M 81_sub/Light_b_20250102-000000.fit", b"y" * 800, mtime=2.0)
+    assert run_cli(tmp_path, "run", device=d, extra_env={"RECLAIM_ENABLED": "true"}) == 0
+    assert len(d.list_files()) == 1  # override False beats env true → survives
+
+
+def test_mid_pass_override_does_not_half_apply(tmp_path):
+    # spec §Testing: effective config is a per-pass SNAPSHOT — an override
+    # written mid-pass (as the MQTT thread would) never half-applies
+    from seestar_sync.settings import SettingsStore
+
+    store_box = {}
+
+    class FlippingDevice(FakeDevice):
+        def open_read(self, path):
+            if not store_box.get("flipped"):
+                store_box["flipped"] = True
+                store_box["store"].set("dry_run", True, "2026-07-10T00:00:00Z")
+            return super().open_read(path)
+
+    d = FlippingDevice()
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * 4, mtime=1.0)
+    d.put("B_sub/Light_b_20250102-000000.fit", b"b" * 4, mtime=2.0)
+    store_box["store"] = SettingsStore(
+        tmp_path / "archive" / ".seestar-sync" / "settings.json"
+    )
+    assert run_cli(tmp_path, "run", "--init", device=d) == 0
+    # flip happened after file A's read, yet BOTH files really copied
+    assert (tmp_path / "archive" / "MyWorks" / "B_sub"
+            / "Light_b_20250102-000000.fit").exists()
+    d.put("C_sub/Light_c_20250103-000000.fit", b"c" * 4, mtime=3.0)
+    assert run_cli(tmp_path, "run", device=d) == 0
+    assert not (tmp_path / "archive" / "MyWorks" / "C_sub"
+                / "Light_c_20250103-000000.fit").exists()  # next pass: dry run
+
+
+def test_third_party_loggers_quieted(tmp_path):
+    import logging
+
+    run_cli(tmp_path, "run", "--init")
+    assert logging.getLogger("smbprotocol").level == logging.WARNING
+    assert logging.getLogger("paho").level == logging.WARNING
+
+
+def test_debug_level_keeps_third_party_loggers_verbose(tmp_path):
+    import logging
+
+    logging.getLogger("smbprotocol").setLevel(logging.NOTSET)  # reset from prior test
+    run_cli(tmp_path, "run", "--init", extra_env={"LOG_LEVEL": "DEBUG"})
+    assert logging.getLogger("smbprotocol").level == logging.NOTSET
