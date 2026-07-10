@@ -93,7 +93,7 @@ under Docker, `docker compose`, or a bare `uv run seestar-sync`).
 | `KUMA_PUSH_URL` | *(unset)* | Uptime Kuma push-monitor URL. Must be `http://` or `https://` if set. |
 | `MQTT_HOST` | *(unset)* | Home Assistant MQTT broker host. Unset disables MQTT entirely (byte-for-byte v0.1 behavior). Only meaningful in `daemon` mode. |
 | `MQTT_PORT` | `1883` | Broker port. Must be `1`-`65535`. |
-| `MQTT_USERNAME` | *(unset)* | Broker username. Required if `MQTT_HOST` is set — anonymous brokers are not supported (see Security note). |
+| `MQTT_USERNAME` | *(unset)* | Broker username. Required if `MQTT_HOST` is set (enforced at startup) — anonymous brokers are not supported (see Security note). |
 | `MQTT_PASSWORD` | *(unset)* | Broker password. **Secret** — `.env` only, never logged, never in `status.json`/history. Required if `MQTT_USERNAME` is set. |
 | `MQTT_TOPIC_PREFIX` | `seestar-sync` | Topic namespace and HA device identifier. Must be a single topic segment (no `/ # +`) — set a different value per scope if you run more than one instance against the same broker. |
 | `DRY_RUN` | `false` | Accepts `1`/`true`/`yes`/`on` (true) or `0`/`false`/`no`/`off`/empty (false); anything else is a fatal config error. Plans copies/deletes but performs neither. |
@@ -298,10 +298,11 @@ monitoring feed: the command topics let anyone who can publish to them arm delet
 (`Reclaim enabled` ON), disarm dry-run (`Dry run` OFF), and redirect the sync target to
 an arbitrary host (`Seestar host`) — full control over what gets copied, what gets
 deleted, and where from. Always set `MQTT_USERNAME`/`MQTT_PASSWORD` and point
-`MQTT_HOST` at an authenticated broker — never an anonymous/open one. (Config
-validation enforces internal consistency — a username implies a host, a password
-implies a username — but does not itself require a broker to demand auth; the
-anonymous-broker prohibition is an operational requirement, not a startup check.)
+`MQTT_HOST` at an authenticated broker — never an anonymous/open one. (Supplying
+credentials is enforced at startup — `MQTT_HOST` without `MQTT_USERNAME` is rejected
+as a fatal config error. What the tool *cannot* verify from its side is whether the
+broker itself rejects anonymous clients, so configuring the broker to require
+authentication remains your responsibility.)
 Treat broker compromise as equivalent to compromising this tool directly.
 `MQTT_PASSWORD` is a secret like the Kuma push URL: it belongs in `.env` only, is never
 written to `status.json`/history, and is redacted from log output even in error paths.
