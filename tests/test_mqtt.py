@@ -145,6 +145,34 @@ def test_progress_throttle(tmp_path):
     assert ("seestar-sync/state", "idle", True) in fake.published
 
 
+def test_interim_summary_throttled_retained_and_totals_only(tmp_path):
+    from seestar_sync.models import RunSummary
+
+    rep, fake, clock, *_ = make(tmp_path)
+    rep.start()
+    fake.published.clear()
+
+    s = RunSummary(started_at="2026-07-10T00:00:00Z", result="ok")
+    s.files_copied, s.bytes_copied = 1, 100
+    rep.handle_summary(s)  # first snapshot publishes immediately
+    s.files_copied, s.bytes_copied = 2, 300
+    rep.handle_summary(s)  # throttled (<10s), dropped
+
+    summ = [p for p in fake.published if p[0] == "seestar-sync/summary"]
+    assert len(summ) == 1
+    assert summ[0][2] is True  # retained
+    assert json.loads(summ[0][1])["bytes_copied"] == 100
+
+    clock.t += THROTTLE_SECONDS
+    rep.handle_summary(s)  # now the updated totals go out
+    summ = [p for p in fake.published if p[0] == "seestar-sync/summary"]
+    assert len(summ) == 2
+    assert json.loads(summ[-1][1])["bytes_copied"] == 300
+    # interim publishes ONLY the summary topic — never state (progress owns it)
+    # or settings; those belong to the authoritative end-of-pass publish_summary
+    assert {t for t, _, _ in fake.published} == {"seestar-sync/summary"}
+
+
 def test_command_round_trip_and_invalid_payloads(tmp_path):
     rep, fake, _, config, store = make(tmp_path)
     rep.start()

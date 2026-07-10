@@ -367,6 +367,21 @@ def test_observer_exception_never_aborts_the_copy(env, monkeypatch):
     assert not list((archive.root / "MyWorks" / "A_sub").glob("*.part"))
 
 
+def test_on_summary_reports_running_totals_during_copy(env):
+    # the summary snapshot climbs live per completed file, so HA's Bytes/Files
+    # copied sensors move during a pass instead of staying Unknown until the end
+    archive, manifest = env
+    d = FakeDevice(capacity=10_000_000)  # roomy: no reclaim pressure
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * 100, mtime=1.0)
+    d.put("B_sub/Light_b_20250102-000000.fit", b"b" * 200, mtime=1.0)
+    snaps: list[tuple[int, int]] = []
+    run_sync(d, archive, manifest, config(), now=1_000_000.0,
+             on_summary=lambda s: snaps.append((s.files_copied, s.bytes_copied)))
+    assert [n for n, _ in snaps] == [1, 2]  # files_copied climbs one per file
+    assert snaps[-1] == (2, 300)  # final running total = both files
+    assert snaps[0][1] < snaps[1][1]  # bytes_copied strictly climbs
+
+
 def test_heartbeat_line_formats_and_guards_zero_size():
     from seestar_sync.syncrun import _heartbeat_line
 

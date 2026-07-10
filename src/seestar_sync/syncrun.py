@@ -57,6 +57,7 @@ def run_sync(
     now: float | None = None,
     should_stop: Callable[[], bool] | None = None,
     observer: Callable[[ProgressEvent], None] | None = None,
+    on_summary: Callable[[RunSummary], None] | None = None,
 ) -> RunSummary:
     """Execute one sync pass and return its summary.
 
@@ -71,6 +72,9 @@ def run_sync(
     now = time.time() if now is None else now
     should_stop = should_stop or (lambda: False)
     notify = observer or (lambda e: None)
+    # in-pass summary snapshots so "Bytes/Files copied" climb live; consumer
+    # throttles and must not raise (same contract as observer)
+    report_summary = on_summary or (lambda s: None)
     summary = RunSummary(
         started_at=iso(now), result="ok",
         dry_run=config.dry_run, reclaim_enabled=config.reclaim_enabled,
@@ -93,13 +97,15 @@ def run_sync(
         log.info("session guard: skipping active folders %s", sorted(active))
 
     device_gone = _copy_phase(
-        device, archive, manifest, config, files, active, summary, now, should_stop, notify
+        device, archive, manifest, config, files, active, summary, now, should_stop,
+        notify, report_summary
     )
 
     if not device_gone and not should_stop():
         if config.reclaim_enabled:
             _reclaim_phase(
-                device, manifest, config, files, active, summary, now, should_stop, notify
+                device, manifest, config, files, active, summary, now, should_stop,
+                notify, report_summary
             )
         else:
             # deletion is opt-in (user-ratified): copy-only mode still
@@ -120,7 +126,8 @@ def run_sync(
 
 
 def _copy_phase(
-    device, archive, manifest, config, files, active, summary, now, should_stop, notify
+    device, archive, manifest, config, files, active, summary, now, should_stop,
+    notify, report_summary
 ) -> bool:
     """Returns True if the device vanished mid-phase."""
     is_synced = lambda f: manifest.verified_ok(f.path, f.size, f.mtime)  # noqa: E731
@@ -150,6 +157,7 @@ def _copy_phase(
             notify(ProgressEvent(phase="copying", files_done=files_done,
                                  files_total=files_total, bytes_done=bytes_done,
                                  bytes_total=bytes_total, current_path=f.path))
+            report_summary(summary)
             continue
         log.info("copying %s (%d bytes)", f.path, f.size)
         base = bytes_done  # bytes from files already completed this pass
@@ -199,6 +207,7 @@ def _copy_phase(
         notify(ProgressEvent(phase="copying", files_done=files_done,
                              files_total=files_total, bytes_done=bytes_done,
                              bytes_total=bytes_total, current_path=f.path))
+        report_summary(summary)
         log.info("copied %s (%d bytes)", f.path, f.size)
     return False
 
@@ -212,7 +221,8 @@ def _report_usage_only(device, summary) -> None:
 
 
 def _reclaim_phase(
-    device, manifest, config, files, active, summary, now, should_stop, notify
+    device, manifest, config, files, active, summary, now, should_stop,
+    notify, report_summary
 ) -> None:
     try:
         usage = device.disk_usage()
@@ -252,6 +262,7 @@ def _reclaim_phase(
                 notify(ProgressEvent(phase="reclaiming", files_done=files_done,
                                      files_total=files_total, bytes_done=bytes_done,
                                      bytes_total=bytes_total, current_path=d.file.path))
+                report_summary(summary)
                 continue
             # Preconditions re-checked at delete time, not plan time:
             try:
@@ -276,6 +287,7 @@ def _reclaim_phase(
             notify(ProgressEvent(phase="reclaiming", files_done=files_done,
                                  files_total=files_total, bytes_done=bytes_done,
                                  bytes_total=bytes_total, current_path=d.file.path))
+            report_summary(summary)
             log.info("deleted [tier %d] %s (%d bytes)", d.tier, d.file.path, d.file.size)
             if d.tier == Tier.SUBS:
                 emptied_sub_folders.add(top_folder(d.file.path))

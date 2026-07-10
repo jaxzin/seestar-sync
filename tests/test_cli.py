@@ -232,9 +232,14 @@ def test_one_run_wires_mqtt_observer_and_summary(tmp_path):
         def __init__(self):
             self.events = []
             self.summaries = []
+            self.interim = []
 
         def handle_progress(self, event):
             self.events.append(event)
+
+        def handle_summary(self, summary):
+            # snapshot values (summary is mutated in place across the pass)
+            self.interim.append((summary.files_copied, summary.bytes_copied))
 
         def publish_summary(self, summary, effective, sources):
             self.summaries.append((summary, effective, sources))
@@ -257,6 +262,8 @@ def test_one_run_wires_mqtt_observer_and_summary(tmp_path):
     summary, effective, sources = mqtt.summaries[0]
     assert summary.result == "ok"
     assert set(sources) == {"dry_run", "reclaim_enabled", "seestar_host"}
+    # interim summary fired live during the pass (one 4-byte file completed)
+    assert mqtt.interim == [(1, 4)]
 
     def dead_factory(c):
         raise DeviceUnavailable("off")
@@ -264,6 +271,7 @@ def test_one_run_wires_mqtt_observer_and_summary(tmp_path):
     mqtt2 = StubMqtt()
     assert _one_run(cfg, archive, dead_factory, mqtt=mqtt2) == 0
     assert mqtt2.events == []  # no pass ran
+    assert mqtt2.interim == []  # ...so no interim summaries either
     assert len(mqtt2.summaries) == 1
     assert mqtt2.summaries[0][0].result == "skipped_unreachable"
 

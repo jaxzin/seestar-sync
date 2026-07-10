@@ -55,6 +55,7 @@ class MqttReporter:
         self._client = None
         self._prefix = config.mqtt_topic_prefix
         self._last_progress_publish = -THROTTLE_SECONDS
+        self._last_summary_publish = -THROTTLE_SECONDS
         self._last_phase: str | None = None
 
     # ---- lifecycle -------------------------------------------------------
@@ -131,6 +132,24 @@ class MqttReporter:
                           retain=True)
         except Exception as e:  # noqa: BLE001
             log.warning("mqtt progress publish failed (non-fatal): %s", self._redact(e))
+
+    def handle_summary(self, summary: RunSummary) -> None:
+        """Interim (in-pass) summary snapshot so Bytes/Files copied climb live.
+
+        Publishes only the running-totals topic, throttled like progress; it
+        deliberately does NOT touch state (progress owns that) or settings. The
+        authoritative end-of-pass publish (with final result + state + settings)
+        is still publish_summary. Never raises — telemetry must not fail a run."""
+        if self._client is None:
+            return
+        try:
+            now = self._clock()
+            if now - self._last_summary_publish < THROTTLE_SECONDS:
+                return
+            self._last_summary_publish = now
+            self._publish("summary", json.dumps(summary.to_json()), retain=True)
+        except Exception as e:  # noqa: BLE001
+            log.warning("mqtt interim summary publish failed (non-fatal): %s", self._redact(e))
 
     def publish_summary(self, summary: RunSummary, effective: Config,
                         sources: dict[str, str]) -> None:

@@ -62,6 +62,7 @@ def _one_run(config: Config, archive: Archive, device_factory,
     from .device import DeviceUnavailable
 
     observer = mqtt.handle_progress if mqtt is not None else None
+    on_summary = mqtt.handle_summary if mqtt is not None else None
     try:
         device = device_factory(effective)
     except DeviceUnavailable:
@@ -76,7 +77,8 @@ def _one_run(config: Config, archive: Archive, device_factory,
         return 0
     with Manifest(archive.meta_dir / "manifest.db") as manifest:
         summary = run_sync(device, archive, manifest, effective,
-                           should_stop=should_stop, observer=observer)
+                           should_stop=should_stop, observer=observer,
+                           on_summary=on_summary)
     report_all(effective, archive.meta_dir, summary)
     if mqtt is not None:
         mqtt.publish_summary(summary, effective, sources)
