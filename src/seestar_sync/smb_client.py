@@ -1,0 +1,125 @@
+"""Production DeviceClient over SMB (smbprotocol's high-level smbclient API).
+
+Protocol facts (verified via ZWO docs + seestarpy source; see spec §Device facts):
+share "EMMC Images", guest auth with empty username/password, direct TCP 445.
+The RPC port (4700) is auth-locked on fw >= 7.18 and deliberately unused here.
+"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import contextmanager
+from typing import BinaryIO
+
+import smbclient
+from smbprotocol.exceptions import SMBException
+
+from .device import DeviceUnavailable
+from .models import DeviceFile, DiskUsage
+
+log = logging.getLogger(__name__)
+
+SHARE = "EMMC Images"
+ROOT = "MyWorks"
+
+
+class SmbDeviceClient:
+    def __init__(self, host: str, capacity_gb: float | None = None, timeout: float = 30.0):
+        self._host = host
+        self._capacity_bytes = (
+            int(capacity_gb * 1024**3) if capacity_gb is not None else None
+        )
+        with self._map_errors():
+            smbclient.register_session(
+                host,
+                username="guest",
+                password="",
+                connection_timeout=timeout,
+                auth_protocol="ntlm",
+            )
+
+    def _unc(self, rel: str = "") -> str:
+        base = rf"\\{self._host}\{SHARE}\{ROOT}"
+        if not rel:
+            return base
+        # rel is device-controlled: refuse anything that could address outside
+        # MyWorks (deletion is the high-blast-radius path through here).
+        parts = rel.split("/")
+        if rel.startswith("/") or "\\" in rel or ".." in parts or "" in parts:
+            raise ValueError(f"unsafe device path rejected: {rel!r}")
+        return base + "\\" + rel.replace("/", "\\")
+
+    def _rel(self, unc: str) -> str:
+        prefix = self._unc() + "\\"
+        return unc.removeprefix(prefix).replace("\\", "/")
+
+    @contextmanager
+    def _map_errors(self):
+        """Connectivity problems -> DeviceUnavailable; missing files pass through."""
+        try:
+            yield
+        except FileNotFoundError:
+            raise
+        except (SMBException, ConnectionError, TimeoutError, OSError) as e:
+            raise DeviceUnavailable(f"{self._host}: {e}") from e
+
+    def list_files(self) -> list[DeviceFile]:
+        out: list[DeviceFile] = []
+        with self._map_errors():
+            self._scan(self._unc(), "", out)
+        return out
+
+    def _scan(self, unc: str, rel_prefix: str, out: list[DeviceFile]) -> None:
+        for entry in smbclient.scandir(unc):
+            rel = f"{rel_prefix}{entry.name}"
+            if entry.is_dir():
+                self._scan(f"{unc}\\{entry.name}", f"{rel}/", out)
+            else:
+                st = entry.stat()  # cached from the directory listing
+                out.append(DeviceFile(rel, st.st_size, st.st_mtime))
+
+    def stat(self, path: str) -> DeviceFile:
+        with self._map_errors():
+            st = smbclient.stat(self._unc(path))
+        return DeviceFile(path, st.st_size, st.st_mtime)
+
+    def open_read(self, path: str) -> BinaryIO:
+        with self._map_errors():
+            return smbclient.open_file(self._unc(path), mode="rb")
+
+    def delete_file(self, path: str) -> None:
+        with self._map_errors():
+            smbclient.remove(self._unc(path))
+
+    def remove_dir_if_empty(self, folder: str) -> bool:
+        # Deliberately NOT via _map_errors: a failed empty-dir cleanup is
+        # cosmetic, and rmdir-on-non-empty arrives as an OSError we can't
+        # distinguish from a connection error after wrapping.
+        try:
+            smbclient.rmdir(self._unc(folder))
+            return True
+        except (SMBException, OSError):
+            return False  # not empty, already gone, or transient — all cosmetic
+
+    def _stat_volume(self):
+        return smbclient.stat_volume(self._unc())
+
+    def disk_usage(self) -> DiskUsage:
+        """Primary: SMB2 FsFullSizeInformation via stat_volume (live-smoke
+        validated, spec Open item 1). Fallback: walk-derived usage against
+        DEVICE_CAPACITY_GB."""
+        try:
+            v = self._stat_volume()
+            return DiskUsage(total_bytes=v.total_size, free_bytes=v.actual_available_size)
+        except (SMBException, OSError, NotImplementedError) as e:
+            if self._capacity_bytes is None:
+                raise DeviceUnavailable(
+                    f"stat_volume failed ({e}) and DEVICE_CAPACITY_GB is not set — "
+                    "cannot measure free space, refusing to reclaim blind"
+                ) from e
+            log.warning("stat_volume failed (%s); using walk-based fallback", e)
+            used = sum(f.size for f in self.list_files())
+            return DiskUsage(
+                total_bytes=self._capacity_bytes,
+                free_bytes=max(0, self._capacity_bytes - used),
+            )
