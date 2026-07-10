@@ -123,6 +123,12 @@ Replace the `ha_webhook_url: str | None` dataclass field with:
 `repr=False` only. Python permits `field(repr=False)` without a default in a
 frozen dataclass as long as later fields also lack defaults, which holds here.)
 
+Apply the same to the Kuma push URL (its token has the same repr-leak class):
+
+```python
+    kuma_push_url: str | None = dataclasses.field(repr=False)  # push token
+```
+
 In `from_env`, replace `ha_webhook_url=_http_url(env, "HA_WEBHOOK_URL"),` with `# (HA webhook removed in v0.2 — MQTT replaces it; Kuma stays)` and add before the `return cls(...)`:
 
 ```python
@@ -187,7 +193,7 @@ git commit -m "feat: MQTT config surface; remove HA webhook reporter (v0.2)" -- 
 
 **Interfaces:**
 - Produces: `ProgressEvent` frozen dataclass in models.py: `phase: str` (`"listing" | "copying" | "reclaiming" | "done"`), `files_done: int = 0`, `files_total: int = 0`, `bytes_done: int = 0`, `bytes_total: int = 0`, `current_path: str | None = None`. `run_sync(..., observer: Callable[[ProgressEvent], None] | None = None)`.
-- Emission contract (later tasks rely on it): `listing` once at pass start; `copying` with totals once when the copy plan is known, then after EACH file copied (files_done/bytes_done cumulative, current_path set); `reclaiming` with totals once when the deletion plan is known, then after each delete; `done` exactly once as the LAST event of every pass (including unreachable and dry-run passes). Dry-run passes emit the same shape with planned counts. Observer callbacks are invoked synchronously; they must not raise (consumer's job — run_sync does NOT guard them; a raising observer crashes loud like any programming error).
+- Emission contract (later tasks rely on it): `listing` once at pass start; `copying` with totals once when the copy plan is known (announcement gated on a NON-EMPTY plan, same as reclaiming — idle passes emit only listing/done), then after EACH file copied (files_done/bytes_done cumulative, current_path set); `reclaiming` with totals once when the deletion plan is known, then after each delete; `done` exactly once as the LAST event of every pass (including unreachable and dry-run passes). Dry-run passes emit the same shape with planned counts. Observer callbacks are invoked synchronously; they must not raise (consumer's job — run_sync does NOT guard them; a raising observer crashes loud like any programming error).
 
 - [ ] **Step 1: Write the failing tests** — add to `tests/test_syncrun.py`:
 
@@ -321,8 +327,9 @@ In `_copy_phase`, after the plan is computed, restructure the loop head to annou
     bytes_total = sum(f.size for f in plan)
     files_done = 0
     bytes_done = 0
-    notify(ProgressEvent(phase="copying", files_total=files_total,
-                         bytes_total=bytes_total))
+    if plan:  # idle passes emit only listing/done — no "copying 0/0" state blip
+        notify(ProgressEvent(phase="copying", files_total=files_total,
+                             bytes_total=bytes_total))
     for f in plan:
 ```
 
