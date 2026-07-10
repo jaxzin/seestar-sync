@@ -182,6 +182,12 @@ def test_webhook_urls_must_be_http():
     assert cfg.ha_webhook_url == "https://ha.local/api/webhook/x"
 
 
+def test_reclaim_is_opt_in():
+    # deletion must be explicitly enabled — a default config can never reclaim
+    assert Config.from_env(base_env()).reclaim_enabled is False
+    assert Config.from_env(base_env(RECLAIM_ENABLED="true")).reclaim_enabled is True
+
+
 def test_bad_log_level_is_fatal():
     with pytest.raises(ConfigError, match="LOG_LEVEL"):
         Config.from_env(base_env(LOG_LEVEL="banana"))
@@ -261,6 +267,7 @@ class Config:
     seestar_host: str
     archive_dir: Path
     sync_interval_minutes: int
+    reclaim_enabled: bool
     reclaim_trigger_percent: float
     reclaim_target_percent: float
     active_window_minutes: int
@@ -315,6 +322,8 @@ class Config:
             seestar_host=host,
             archive_dir=Path(env.get("ARCHIVE_DIR", "/archive")),
             sync_interval_minutes=interval,
+            # deletion is opt-in (user-ratified): default false = copy-only
+            reclaim_enabled=_bool(env, "RECLAIM_ENABLED"),
             reclaim_trigger_percent=trigger,
             reclaim_target_percent=target,
             active_window_minutes=window,
@@ -330,7 +339,7 @@ class Config:
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_config.py -v`
-Expected: 11 passed
+Expected: 12 passed
 
 - [ ] **Step 6: Commit**
 
@@ -1828,7 +1837,9 @@ def env(tmp_path):
 
 
 def config(**overrides):
-    env_vars = {"SEESTAR_HOST": "h"}
+    # most tests exercise the reclaim engine, so enable it here; the opt-in
+    # default (reclaim_enabled=False) is pinned by its own dedicated test
+    env_vars = {"SEESTAR_HOST": "h", "RECLAIM_ENABLED": "true"}
     env_vars.update(overrides)
     return Config.from_env(env_vars)
 
@@ -2000,6 +2011,23 @@ def test_should_stop_bounds_shutdown_to_one_file(env):
     assert s.result == "ok"
 
 
+def test_reclaim_disabled_by_default_is_copy_only(env):
+    # user-ratified: deletion is opt-in. A DEFAULT config under storage
+    # pressure with verified copies must still never delete anything.
+    archive, manifest = env
+    cfg = Config.from_env({"SEESTAR_HOST": "h"})
+    assert cfg.reclaim_enabled is False
+    d = FakeDevice(capacity=1000)
+    path = "M 81_sub/Light_a_20250101-000000.fit"
+    d.put(path, b"x" * 800, mtime=1.0)  # 80% used — past the trigger
+    s = run_sync(d, archive, manifest, cfg, now=1_000_000.0)
+    assert s.files_copied == 1  # copying proceeds normally
+    assert s.files_deleted == 0
+    assert len(d.list_files()) == 1  # nothing deleted
+    assert s.device_used_percent == 80.0  # fill level still reported
+    assert s.result == "ok"
+
+
 def test_dry_run_touches_nothing(env):
     archive, manifest = env
     d = FakeDevice(capacity=1000)
@@ -2150,7 +2178,15 @@ def run_sync(
     )
 
     if not device_gone and not should_stop():
-        _reclaim_phase(device, manifest, config, files, active, summary, now, should_stop)
+        if config.reclaim_enabled:
+            _reclaim_phase(
+                device, manifest, config, files, active, summary, now, should_stop
+            )
+        else:
+            # deletion is opt-in (user-ratified): copy-only mode still
+            # reports fill level best-effort so monitoring sees the device
+            _report_usage_only(device, summary)
+            log.info("reclaim disabled (RECLAIM_ENABLED=false): copy-only mode")
 
     if summary.errors:
         summary.result = "partial"
@@ -2197,6 +2233,14 @@ def _copy_phase(
         summary.bytes_copied += f.size
         log.info("copied %s (%d bytes)", f.path, f.size)
     return False
+
+
+def _report_usage_only(device, summary) -> None:
+    """Best-effort fill level for monitoring; never fails a copy-only run."""
+    try:
+        summary.device_used_percent = round(device.disk_usage().used_percent, 1)
+    except (DeviceUnavailable, FreeSpaceUnavailable) as e:
+        log.debug("fill level unavailable in copy-only mode: %s", e)
 
 
 def _reclaim_phase(
@@ -2267,7 +2311,7 @@ def _reclaim_phase(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_syncrun.py -v`
-Expected: 15 passed
+Expected: 16 passed
 
 - [ ] **Step 5: Run the whole suite**
 
@@ -3047,6 +3091,7 @@ services:
       SEESTAR_HOST: ${SEESTAR_HOST:?set SEESTAR_HOST in .env}
       DRY_RUN: ${DRY_RUN:-true}          # rollout: stays true until dry-run output is reviewed
       SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-15}
+      RECLAIM_ENABLED: ${RECLAIM_ENABLED:-false}   # deletion is opt-in
       RECLAIM_TRIGGER_PERCENT: ${RECLAIM_TRIGGER_PERCENT:-75}
       RECLAIM_TARGET_PERCENT: ${RECLAIM_TARGET_PERCENT:-60}
       ACTIVE_WINDOW_MINUTES: ${ACTIVE_WINDOW_MINUTES:-15}
@@ -3082,7 +3127,7 @@ Content requirements (write actual prose, not headings-only — every item below
 
 - What the tool does (one paragraph, mention keeping stacked JPGs on-device for in-app browsing).
 - Quick start on a Mac: create `.env` with `SEESTAR_HOST`, `ARCHIVE_HOST_PATH`; mount the NAS share in Finder first; `docker compose up -d`; first-run `--init` via `docker compose run --rm seestar-sync run --init`.
-- The rollout sequence: DRY_RUN=true for several days → review logs + `status.json` deletion plans → DRY_RUN=false, reclaim graduates last.
+- The rollout sequence, four phases keyed to the two switches (deletion is opt-in): (1) DRY_RUN=true — review copy plans; (2) DRY_RUN=false with RECLAIM_ENABLED=false (both defaults) — real copies, deletion structurally impossible; (3) DRY_RUN=true + RECLAIM_ENABLED=true — review the real per-file deletion plan (only possible after verified copies exist, since reclaim considers only NAS-verified files); (4) DRY_RUN=false + RECLAIM_ENABLED=true — full operation.
 - Full env-var table matching `config.py` actuals (including validation behavior: positive intervals, http(s)-only webhook URLs, LOG_LEVEL allowlist).
 - CLI subcommands + exit codes as implemented (0 ok/skipped_unreachable, 1 partial/error, 2 config/archive). Show `status` invoked via `docker compose run --rm seestar-sync status` or `exec` — it requires SEESTAR_HOST in env, so a bare host-side invocation surprises (tech-writer advisory). Describe `status` as reading `status.json` (what it actually does — not the spec's "status.json + manifest" phrasing).
 - How reclaim tiers work; what is never deleted (stacked JPGs/thumbnails, unknown types); note Tier 2 is any `.avi`/`.mp4` outside `_sub` folders — deliberately broader than "solar-system folders", media-type-defined to avoid firmware folder-name coupling (user-ratified).

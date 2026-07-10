@@ -120,6 +120,7 @@ post-processable by existing community organizer tools):
 | `SEESTAR_HOST` | *(required)* | Hostname/IP of the Seestar |
 | `ARCHIVE_DIR` | `/archive` | Mounted destination volume |
 | `SYNC_INTERVAL_MINUTES` | `15` | Poll cadence in daemon mode |
+| `RECLAIM_ENABLED` | `false` | Master switch for the reclaim phase. Copy-only until explicitly enabled — deletion is opt-in (user-ratified 2026-07-09; replaces the earlier implicit-on default so a first real run can never mass-delete before the operator has reviewed a deletion plan) |
 | `RECLAIM_TRIGGER_PERCENT` | `75` | Start deleting when device usage exceeds this |
 | `RECLAIM_TARGET_PERCENT` | `60` | Stop deleting once usage falls below this |
 | `ACTIVE_WINDOW_MINUTES` | `15` | Recent-write window marking a folder as active |
@@ -171,6 +172,10 @@ write is also only a warning; only the archive volume itself is load-bearing.
 **Free-space measurement:** SMB2 `FsFullSizeInformation` query against the
 share (validation spike — see Open items). Fallback: full-walk usage vs.
 `DEVICE_CAPACITY_GB`.
+
+**Master switch:** the entire reclaim phase runs only when
+`RECLAIM_ENABLED=true`. When disabled, the run is copy-only; fill level is
+still reported best-effort for monitoring, and an INFO line notes the mode.
 
 **Hysteresis loop:** when usage > `RECLAIM_TRIGGER_PERCENT`, delete until
 usage < `RECLAIM_TARGET_PERCENT`, then stop.
@@ -259,10 +264,16 @@ TDD (superpowers:test-driven-development), three rings:
    reachability, share layout assertions, `FsFullSizeInformation` spike,
    full `DRY_RUN` pass.
 
-**Rollout on the Mac:** dry-run daemon for several days (watch JSONL) →
-enable copying → enable reclaim only after eyeballing correct dry-run
-deletion plans. Copy bugs waste bandwidth; delete bugs destroy data — they
-graduate on different schedules.
+**Rollout on the Mac** (four phases, each a first-class config state):
+1. `DRY_RUN=true` — review copy plans in logs.
+2. `DRY_RUN=false`, `RECLAIM_ENABLED=false` (both defaults do this) — real
+   copies, structurally no deletion possible.
+3. `DRY_RUN=true`, `RECLAIM_ENABLED=true` — verified rows now exist, so the
+   logs show the real per-file deletion plan without executing it.
+4. `DRY_RUN=false`, `RECLAIM_ENABLED=true` — full operation.
+
+Copy bugs waste bandwidth; delete bugs destroy data — they graduate on
+different schedules, and deletion is opt-in by default.
 
 ## Open items (validation spikes, first implementation steps)
 
