@@ -15,9 +15,9 @@ def test_write_status_snapshot(tmp_path):
     data = json.loads((tmp_path / "status.json").read_text())
     # exact spec contract — this JSON is also the HA webhook payload
     assert set(data) == {
-        "last_run", "result", "dry_run", "files_copied", "bytes_copied",
-        "files_deleted", "bytes_reclaimed", "device_used_percent",
-        "active_folders_skipped", "errors",
+        "last_run", "result", "dry_run", "reclaim_enabled", "files_copied",
+        "bytes_copied", "files_deleted", "bytes_reclaimed",
+        "device_used_percent", "active_folders_skipped", "errors",
     }
     assert data["result"] == "ok"
     assert data["files_copied"] == 2
