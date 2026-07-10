@@ -41,6 +41,14 @@ def _prepare(config: Config, init: bool) -> Archive:
 
 
 def _one_run(config: Config, archive: Archive, device_factory, should_stop=None) -> int:
+    # The mount-drop trap is a MID-LIFE event, not just a startup one: in
+    # daemon mode the archive volume can vanish between scheduled passes.
+    # Re-check before every pass — otherwise Manifest.__init__'s mkdir would
+    # silently rebuild a phantom archive on the container's own layer and
+    # reclaim would delete device originals against it. ArchiveError
+    # propagates to main's handler → exit 2 (crash-loud; the restart loop +
+    # Kuma silence alert the operator).
+    archive.check_ready(allow_root_fs=config.archive_on_root_fs_ok)
     from .device import DeviceUnavailable
 
     try:
@@ -69,7 +77,7 @@ def _cmd_daemon(config: Config, args, device_factory) -> int:
     stop = threading.Event()
 
     def _handle_signal(signum, frame):
-        log.info("received signal %d; exiting after current run", signum)
+        log.info("received signal %d; finishing current file, then exiting", signum)
         stop.set()
 
     # The container runs this as PID 1: without a handler, docker stop's
@@ -141,13 +149,22 @@ def main(
         description="Mirror Seestar media to a NAS over SMB and reclaim device space.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    for name, handler in (("daemon", _cmd_daemon), ("run", _cmd_run)):
-        p = sub.add_parser(name)
+    for name, handler, help_text in (
+        ("daemon", _cmd_daemon, "scheduled sync loop (container default)"),
+        ("run", _cmd_run, "one sync pass, then exit (for cron / k8s CronJob)"),
+    ):
+        p = sub.add_parser(name, help=help_text, description=help_text)
         p.add_argument("--init", action="store_true",
                        help="first run only: create archive sentinel and directories")
         p.set_defaults(handler=handler)
-    sub.add_parser("status").set_defaults(handler=_cmd_status, init=False)
-    sub.add_parser("rebuild-manifest").set_defaults(handler=_cmd_rebuild_manifest, init=False)
+    status_help = "human-readable summary of the last run"
+    sub.add_parser("status", help=status_help, description=status_help).set_defaults(
+        handler=_cmd_status, init=False
+    )
+    rebuild_help = "re-scan the archive, recompute checksums, rebuild the manifest DB"
+    sub.add_parser(
+        "rebuild-manifest", help=rebuild_help, description=rebuild_help
+    ).set_defaults(handler=_cmd_rebuild_manifest, init=False)
 
     args = parser.parse_args(argv)
     env = os.environ if env is None else env
