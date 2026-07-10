@@ -21,6 +21,7 @@ replaced; Uptime Kuma stays as the independent dead-man switch.
 | Broker | HA Mosquitto add-on; env-var auth (`MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`) |
 | Old reporters | HA webhook **removed** (never deployed); Kuma **kept** (monitoring must not die with the MQTT stack) |
 | Enablement | Entire feature opt-in: `MQTT_HOST` unset → no MQTT anywhere, v0.1 behavior |
+| Modes | MQTT lives in `daemon` mode only (persistent connection, LWT). One-shot `run` skips MQTT but DOES honor SettingsStore overrides — effective config is mode-independent |
 | Housekeeping | Third-party protocol loggers (`smbprotocol`, `spnego`, `paho`) pinned to WARNING unless `LOG_LEVEL=DEBUG` |
 
 ## Architecture
