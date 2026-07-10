@@ -2337,10 +2337,25 @@ def test_error_mapping_wraps_connection_failures():
     with pytest.raises(DeviceUnavailable):
         with c._map_errors():
             raise ConnectionResetError("gone")
+    # smbprotocol wraps connect failures in ValueError — the routine
+    # powered-off-telescope case must map to DeviceUnavailable, not crash
+    with pytest.raises(DeviceUnavailable):
+        with c._map_errors():
+            raise ValueError("Failed to connect to 'seestar.local:445': timed out")
     # FileNotFoundError must pass through untouched (stat contract)
     with pytest.raises(FileNotFoundError):
         with c._map_errors():
             raise FileNotFoundError("missing")
+
+
+def test_traversal_rejection_still_fails_loud():
+    # the widened _map_errors tuple must NOT swallow _unc's containment
+    # check — UNC paths are built before entering the mapping context
+    c = client()
+    c._host = "h"
+    for op in (lambda: c.stat("../escape.fit"), lambda: c.delete_file("../escape.fit")):
+        with pytest.raises(ValueError, match="unsafe device path"):
+            op()
 
 
 def test_disk_usage_fallback_uses_capacity(monkeypatch):
@@ -2486,18 +2501,26 @@ class SmbDeviceClient:
 
     @contextmanager
     def _map_errors(self):
-        """Connectivity problems -> DeviceUnavailable; missing files pass through."""
+        """Connectivity problems -> DeviceUnavailable; missing files pass through.
+
+        ValueError is in the tuple because smbprotocol's transport wraps
+        connect failures in ValueError ("Failed to connect to '<host>:445':
+        timed out") — the routine powered-off-telescope case. UNC paths are
+        built BEFORE entering this context, so _unc's own fail-loud
+        ValueError ("unsafe device path") is never swallowed here.
+        """
         try:
             yield
         except FileNotFoundError:
             raise
-        except (SMBException, ConnectionError, TimeoutError, OSError) as e:
+        except (SMBException, ConnectionError, TimeoutError, OSError, ValueError) as e:
             raise DeviceUnavailable(f"{self._host}: {e}") from e
 
     def list_files(self) -> list[DeviceFile]:
         out: list[DeviceFile] = []
+        root_unc = self._unc()  # UNC built outside _map_errors (see its docstring)
         with self._map_errors():
-            self._scan(self._unc(), "", out)
+            self._scan(root_unc, "", out)
         return out
 
     def _scan(self, unc: str, rel_prefix: str, out: list[DeviceFile]) -> None:
@@ -2510,18 +2533,21 @@ class SmbDeviceClient:
                 out.append(DeviceFile(rel, st.st_size, st.st_mtime))
 
     def stat(self, path: str) -> DeviceFile:
+        unc = self._unc(path)
         with self._map_errors():
-            st = smbclient.stat(self._unc(path))
+            st = smbclient.stat(unc)
         return DeviceFile(path, st.st_size, st.st_mtime)
 
     def open_read(self, path: str) -> BinaryIO:
+        unc = self._unc(path)
         with self._map_errors():
-            raw = smbclient.open_file(self._unc(path), mode="rb")
+            raw = smbclient.open_file(unc, mode="rb")
         return _MappedReader(raw, self._map_errors)
 
     def delete_file(self, path: str) -> None:
+        unc = self._unc(path)
         with self._map_errors():
-            smbclient.remove(self._unc(path))
+            smbclient.remove(unc)
 
     def remove_dir_if_empty(self, folder: str) -> bool:
         # Deliberately NOT via _map_errors: a failed empty-dir cleanup is
@@ -2564,7 +2590,7 @@ class SmbDeviceClient:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_smb_client.py -v`
-Expected: 7 passed
+Expected: 8 passed
 
 - [ ] **Step 5: Commit**
 
