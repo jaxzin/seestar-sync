@@ -3034,9 +3034,16 @@ services:
       SEESTAR_HOST: ${SEESTAR_HOST:?set SEESTAR_HOST in .env}
       DRY_RUN: ${DRY_RUN:-true}          # rollout: stays true until dry-run output is reviewed
       SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-15}
+      RECLAIM_TRIGGER_PERCENT: ${RECLAIM_TRIGGER_PERCENT:-75}
+      RECLAIM_TARGET_PERCENT: ${RECLAIM_TARGET_PERCENT:-60}
+      ACTIVE_WINDOW_MINUTES: ${ACTIVE_WINDOW_MINUTES:-15}
+      DEVICE_CAPACITY_GB: ${DEVICE_CAPACITY_GB:-}   # empty → Config maps to None
       KUMA_PUSH_URL: ${KUMA_PUSH_URL:-}
       HA_WEBHOOK_URL: ${HA_WEBHOOK_URL:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # ARCHIVE_DIR is fixed at /archive by the image; ARCHIVE_ON_ROOT_FS_OK
+      # is deliberately not exposed — it's a dangerous escape hatch that
+      # should never be set in a containerized deployment.
     volumes:
       - ${ARCHIVE_HOST_PATH:?set ARCHIVE_HOST_PATH in .env}:/archive
 ```
