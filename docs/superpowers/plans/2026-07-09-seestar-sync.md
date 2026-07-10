@@ -1172,6 +1172,14 @@ class DeviceUnavailable(Exception):
     powering off is routine, not an error)."""
 
 
+class FreeSpaceUnavailable(Exception):
+    """Free space cannot be measured (firmware won't answer FsFullSizeInformation
+    and DEVICE_CAPACITY_GB is unset). The device is REACHABLE — this is a
+    configuration/firmware problem that permanently disables reclaim, so it
+    must surface as a run error (partial → Kuma silence → operator alerted),
+    never be mistaken for a routine device-off."""
+
+
 class DeviceClient(Protocol):
     def list_files(self) -> list[DeviceFile]:
         """Recursive listing of MyWorks/. Raises DeviceUnavailable."""
@@ -1198,7 +1206,8 @@ class DeviceClient(Protocol):
         ...
 
     def disk_usage(self) -> DiskUsage:
-        """Raises DeviceUnavailable."""
+        """Raises DeviceUnavailable (device gone) or FreeSpaceUnavailable
+        (device fine, measurement impossible)."""
         ...
 ```
 
@@ -1215,12 +1224,30 @@ from seestar_sync.device import DeviceUnavailable
 from seestar_sync.models import DeviceFile, DiskUsage
 
 
+class _FailingReader:
+    """Reader whose open succeeded but whose stream dies — the mid-transfer
+    power-off class the mapped-reader seam must contain."""
+
+    def read(self, n: int = -1) -> bytes:
+        raise DeviceUnavailable("simulated mid-read power-off")
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class FakeDevice:
     def __init__(self, capacity: int = 1_000_000):
         self.capacity = capacity
         self._files: dict[str, tuple[bytes, float]] = {}
         self.fail_after_reads: int | None = None
         self.short_read_paths: set[str] = set()
+        self.fail_mid_read_paths: set[str] = set()  # open succeeds, read() dies
         self.disconnected = False  # flip mid-test to simulate power-off for ALL ops
         self._reads = 0
 
@@ -1245,13 +1272,15 @@ class FakeDevice:
         data, mtime = self._files[path]
         return DeviceFile(path, len(data), mtime)
 
-    def open_read(self, path: str) -> io.BytesIO:
+    def open_read(self, path: str):
         self._check_connection()
         if self.fail_after_reads is not None and self._reads >= self.fail_after_reads:
             raise DeviceUnavailable("simulated mid-run power-off")
         if path not in self._files:
             raise FileNotFoundError(path)  # match production contract (app-side drift)
         self._reads += 1
+        if path in self.fail_mid_read_paths:
+            return _FailingReader()  # open succeeds, read() dies (mid-stream power-off)
         data, _ = self._files[path]
         if path in self.short_read_paths:
             data = data[: max(0, len(data) - 1)]  # torn transfer
@@ -1777,7 +1806,9 @@ import pytest
 
 from seestar_sync.archive import Archive
 from seestar_sync.config import Config
+from seestar_sync.device import DeviceUnavailable
 from seestar_sync.manifest import Manifest
+from seestar_sync.models import DeviceFile
 from seestar_sync.syncrun import run_sync
 from tests.fakes import FakeDevice
 
@@ -1822,6 +1853,7 @@ def test_copies_everything_and_verifies(env):
     s = run_sync(d, archive, manifest, config(), now=1_000_000.0)
     assert s.result == "ok"
     assert s.files_copied == 2
+    assert s.bytes_copied == 303  # 300 (raw) + 3 (jpg) — exact-content bar
     assert archive.dest_path("M 81/DSO_Stacked_1_M 81_10.0s_20250101_000000.jpg").exists()
     # second run: nothing new to do
     s2 = run_sync(d, archive, manifest, config(), now=1_000_100.0)
@@ -1835,6 +1867,8 @@ def test_reclaim_deletes_only_verified_with_write_ahead_audit(env):
     s1 = run_sync(d, archive, manifest, config(), now=1_000_000.0)
     assert s1.files_copied == 1
     assert s1.files_deleted == 1  # verified this run, then reclaimed under pressure
+    assert s1.bytes_reclaimed == 800
+    assert s1.device_used_percent == 80.0  # measured before deletions
     assert d.list_files() == []  # gone from device
     row = manifest.get("M 81_sub/Light_a_20250101-000000.fit")
     assert row.deleted_from_device_at is not None and row.deleted_tier == 1
@@ -1862,6 +1896,38 @@ def test_mid_run_disconnect_keeps_partial_progress(env):
     assert s.files_copied == 1  # first banked before the "power-off"
     assert s.result == "ok"  # clean disconnect, no errors
     assert s.files_deleted == 0  # reclaim skipped once device vanished
+
+
+def test_mid_read_disconnect_banks_progress(env):
+    # the open succeeds, the STREAM dies (canonical mid-transfer power-off):
+    # must abort cleanly with banked progress and no .part debris, not crash
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000)
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * 10, mtime=1.0)
+    d.put("B_sub/Light_b_20250102-000000.fit", b"b" * 10, mtime=1.0)
+    d.fail_mid_read_paths.add("B_sub/Light_b_20250102-000000.fit")
+    s = run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    assert s.result == "ok"
+    assert s.files_copied == 1  # A banked before B's stream died
+    assert not archive.dest_path("B_sub/Light_b_20250102-000000.fit").exists()
+    assert not list((archive.root / "MyWorks" / "B_sub").glob("*.part"))
+
+
+def test_unmeasurable_free_space_surfaces_as_error(env):
+    # a blinded reclaim must alert (partial → Kuma silence), never report ok
+    archive, manifest = env
+    from seestar_sync.device import FreeSpaceUnavailable
+
+    class BlindDevice(FakeDevice):
+        def disk_usage(self):
+            raise FreeSpaceUnavailable("stat_volume unsupported, DEVICE_CAPACITY_GB unset")
+
+    d = BlindDevice(capacity=100_000)
+    d.put("M 81_sub/Light_a_20250101-000000.fit", b"x" * 10, mtime=1.0)
+    s = run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    assert s.result == "partial"
+    assert s.files_copied == 1  # copying still works; only reclaim is blinded
+    assert any("free space" in e for e in s.errors)
 
 
 def test_verify_failure_counts_and_eventually_skips(env):
@@ -1940,6 +2006,66 @@ def test_dry_run_touches_nothing(env):
     assert s.files_copied == 1  # planned counts, for visibility
     assert not archive.dest_path("M 81_sub/Light_a_20250101-000000.fit").exists()
     assert len(d.list_files()) == 1  # nothing deleted
+
+
+def test_dry_run_reclaim_reports_plan_without_touching_anything(env):
+    # the rollout graduation gate: the operator eyeballs dry-run DELETION
+    # plans before enabling reclaim — this branch must report accurately
+    # while executing nothing (including no audit rows)
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000)
+    path = "M 81_sub/Light_a_20250101-000000.fit"
+    d.put(path, b"x" * 8000, mtime=1.0)
+    run_sync(d, archive, manifest, config(), now=1_000_000.0)  # copy + verify
+    d.capacity = 10_000  # now 80% used → reclaim pressure
+    s = run_sync(d, archive, manifest, config(DRY_RUN="true"), now=1_000_100.0)
+    assert s.dry_run is True
+    assert s.files_deleted == 1 and s.bytes_reclaimed == 8000  # plan reported
+    assert len(d.list_files()) == 1  # nothing actually deleted
+    assert manifest.get(path).deleted_from_device_at is None  # no audit row
+
+
+def test_changed_file_is_skipped_at_delete_time(env):
+    # spec hard precondition: fresh stat must still match what was verified —
+    # and the skip must happen BEFORE mark_deleted writes an audit row
+    archive, manifest = env
+
+    class DriftingDevice(FakeDevice):
+        def stat(self, path):
+            f = super().stat(path)
+            return DeviceFile(f.path, f.size, f.mtime + 100.0)  # device rewrote it
+
+    d = DriftingDevice(capacity=100_000)
+    path = "M 81_sub/Light_a_20250101-000000.fit"
+    d.put(path, b"x" * 8000, mtime=1.0)
+    run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    d.capacity = 10_000
+    s = run_sync(d, archive, manifest, config(), now=1_000_100.0)
+    assert s.files_deleted == 0
+    assert len(d.list_files()) == 1  # file survives
+    assert manifest.get(path).deleted_from_device_at is None  # no audit row
+
+
+def test_disconnect_during_delete_leaves_self_healing_audit(env):
+    # the real crash window (not forged state): device dies between the
+    # write-ahead audit commit and the SMB delete → clean abort, audit
+    # stands, file survives — exactly the self-healing false-delete state
+    archive, manifest = env
+
+    class DisconnectingOnDelete(FakeDevice):
+        def delete_file(self, path):
+            raise DeviceUnavailable("power-off mid-delete")
+
+    d = DisconnectingOnDelete(capacity=100_000)
+    path = "M 81_sub/Light_a_20250101-000000.fit"
+    d.put(path, b"x" * 8000, mtime=1.0)
+    run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    d.capacity = 10_000
+    s = run_sync(d, archive, manifest, config(), now=1_000_100.0)
+    assert s.result == "ok" and s.errors == []  # clean abort, not an error
+    assert s.files_deleted == 0
+    assert manifest.get(path).deleted_from_device_at is not None  # audit stands
+    assert len(d.list_files()) == 1  # file still on device
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1971,7 +2097,7 @@ from datetime import datetime, timezone
 from .archive import Archive, VerifyError
 from .classify import active_folders, top_folder
 from .config import Config
-from .device import DeviceClient, DeviceUnavailable
+from .device import DeviceClient, DeviceUnavailable, FreeSpaceUnavailable
 from .manifest import Manifest
 from .models import RunSummary, Tier
 from .planner import plan_copies
@@ -1994,6 +2120,12 @@ def run_sync(
     now: float | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> RunSummary:
+    """Execute one sync pass and return its summary.
+
+    should_stop is a cooperative shutdown check, polled between files (copy
+    phase) and between deletions (reclaim phase) — it never tears an
+    in-flight transfer or splits the audit→delete pair.
+    """
     now = time.time() if now is None else now
     should_stop = should_stop or (lambda: False)
     summary = RunSummary(started_at=iso(now), result="ok", dry_run=config.dry_run)
@@ -2032,9 +2164,9 @@ def _copy_phase(
             log.info("shutdown requested; stopping copy phase between files")
             break
         if manifest.failure_count(f.path) >= MAX_VERIFY_FAILURES:
-            summary.errors.append(
-                f"{f.path}: {MAX_VERIFY_FAILURES} consecutive verify failures, skipping"
-            )
+            msg = f"{f.path}: {MAX_VERIFY_FAILURES} consecutive verify failures, skipping"
+            log.warning(msg)  # errors[] alone is invisible in container logs
+            summary.errors.append(msg)
             continue
         if config.dry_run:
             log.info("DRY_RUN would copy %s (%d bytes)", f.path, f.size)
@@ -2052,7 +2184,9 @@ def _copy_phase(
             return True
         except VerifyError as e:
             count = manifest.bump_failure(f.path)
-            summary.errors.append(f"verify failed ({count}/{MAX_VERIFY_FAILURES}): {e}")
+            msg = f"verify failed ({count}/{MAX_VERIFY_FAILURES}): {e}"
+            log.warning(msg)  # errors[] alone is invisible in container logs
+            summary.errors.append(msg)
             continue
         manifest.record_verified(f.path, f.size, f.mtime, sha, iso(now))
         manifest.clear_failure(f.path)
@@ -2076,6 +2210,11 @@ def _reclaim_phase(
             is_verified=lambda f: manifest.verified_ok(f.path, f.size, f.mtime),
             active=active,
         )
+        if not plan:
+            log.info(
+                "device at %.1f%% used (trigger %.0f%%): no reclaim needed",
+                usage.used_percent, config.reclaim_trigger_percent,
+            )
         emptied_sub_folders: set[str] = set()
         for d in plan:
             if should_stop():
@@ -2111,6 +2250,13 @@ def _reclaim_phase(
         for folder in sorted(emptied_sub_folders):
             if device.remove_dir_if_empty(folder):
                 log.info("removed empty folder %s", folder)
+    except FreeSpaceUnavailable as e:
+        # NOT a routine device-off: reclaim is blinded by config/firmware.
+        # Must surface as partial so Kuma goes silent and the operator is
+        # alerted — otherwise the device fills while monitoring stays green.
+        msg = f"free space unmeasurable, reclaim skipped: {e}"
+        log.error(msg)
+        summary.errors.append(msg)
     except DeviceUnavailable as e:
         log.info("device vanished during reclaim (%s), stopping cleanly", e)
 ```
@@ -2118,7 +2264,7 @@ def _reclaim_phase(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_syncrun.py -v`
-Expected: 10 passed
+Expected: 15 passed
 
 - [ ] **Step 5: Run the whole suite**
 
@@ -2207,6 +2353,41 @@ def test_disk_usage_fallback_uses_capacity(monkeypatch):
     monkeypatch.setattr(c, "list_files", lambda: [DeviceFile("a/b.fit", 600, 0.0)])
     usage = c.disk_usage()
     assert usage.total_bytes == 1000 and usage.free_bytes == 400
+
+
+def test_disk_usage_without_capacity_raises_free_space_unavailable(monkeypatch):
+    # reachable device + unmeasurable space is NOT DeviceUnavailable — it
+    # must surface as an alertable error, not read as a routine power-off
+    from seestar_sync.device import FreeSpaceUnavailable
+
+    c = client()
+    c._host = "h"
+    c._capacity_bytes = None
+    monkeypatch.setattr(c, "_stat_volume", lambda: (_ for _ in ()).throw(OSError("no")))
+    with pytest.raises(FreeSpaceUnavailable, match="DEVICE_CAPACITY_GB"):
+        c.disk_usage()
+
+
+def test_open_read_wraps_mid_stream_failures(monkeypatch):
+    # the open is mapped; the READS must be too — a mid-transfer power-off
+    # must surface as DeviceUnavailable, never a raw ConnectionResetError
+    c = client()
+    c._host = "h"
+
+    class DyingRaw:
+        def read(self, n=-1):
+            raise ConnectionResetError("mid-read power-off")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "seestar_sync.smb_client.smbclient.open_file", lambda *a, **k: DyingRaw()
+    )
+    reader = c.open_read("M 81_sub/a.fit")
+    with pytest.raises(DeviceUnavailable):
+        reader.read()
+    reader.close()  # closing a dead handle must not raise
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2233,13 +2414,44 @@ from typing import BinaryIO
 import smbclient
 from smbprotocol.exceptions import SMBException
 
-from .device import DeviceUnavailable
+from .device import DeviceUnavailable, FreeSpaceUnavailable
 from .models import DeviceFile, DiskUsage
 
 log = logging.getLogger(__name__)
 
 SHARE = "EMMC Images"
 ROOT = "MyWorks"
+
+
+class _MappedReader:
+    """File-like wrapper keeping mid-stream SMB failures inside the seam.
+
+    _map_errors protects the open; the reads happen later, inside
+    archive.write_stream — without this wrapper a telescope powering off
+    mid-transfer leaks a raw ConnectionResetError past DeviceClient and
+    kills the daemon.
+    """
+
+    def __init__(self, raw, map_errors):
+        self._raw = raw
+        self._map_errors = map_errors
+
+    def read(self, n: int = -1) -> bytes:
+        with self._map_errors():
+            return self._raw.read(n)
+
+    def close(self) -> None:
+        try:
+            self._raw.close()
+        except Exception:  # noqa: BLE001 — closing a dead handle is not an event
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
 
 class SmbDeviceClient:
@@ -2304,7 +2516,8 @@ class SmbDeviceClient:
 
     def open_read(self, path: str) -> BinaryIO:
         with self._map_errors():
-            return smbclient.open_file(self._unc(path), mode="rb")
+            raw = smbclient.open_file(self._unc(path), mode="rb")
+        return _MappedReader(raw, self._map_errors)
 
     def delete_file(self, path: str) -> None:
         with self._map_errors():
@@ -2324,17 +2537,21 @@ class SmbDeviceClient:
         return smbclient.stat_volume(self._unc())
 
     def disk_usage(self) -> DiskUsage:
-        """Primary: SMB2 FsFullSizeInformation via stat_volume (live-smoke
-        validated, spec Open item 1). Fallback: walk-derived usage against
-        DEVICE_CAPACITY_GB."""
+        """Primary: SMB2 FsFullSizeInformation via stat_volume (validated by
+        the live smoke ring, Task 13 — spec Open item 1). Fallback:
+        walk-derived usage against DEVICE_CAPACITY_GB."""
         try:
             v = self._stat_volume()
             return DiskUsage(total_bytes=v.total_size, free_bytes=v.actual_available_size)
         except (SMBException, OSError, NotImplementedError) as e:
             if self._capacity_bytes is None:
-                raise DeviceUnavailable(
+                # Distinct from DeviceUnavailable: the device is reachable,
+                # reclaim is blinded — must alert, not read as device-off.
+                raise FreeSpaceUnavailable(
                     f"stat_volume failed ({e}) and DEVICE_CAPACITY_GB is not set — "
-                    "cannot measure free space, refusing to reclaim blind"
+                    "cannot measure free space, refusing to reclaim blind. "
+                    "Set DEVICE_CAPACITY_GB (e.g. 128 for the S30 Pro) to enable "
+                    "the walk-based fallback."
                 ) from e
             log.warning("stat_volume failed (%s); using walk-based fallback", e)
             used = sum(f.size for f in self.list_files())
@@ -2347,7 +2564,7 @@ class SmbDeviceClient:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_smb_client.py -v`
-Expected: 5 passed
+Expected: 7 passed
 
 - [ ] **Step 5: Commit**
 
