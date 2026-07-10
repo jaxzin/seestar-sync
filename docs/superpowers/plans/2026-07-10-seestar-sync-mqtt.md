@@ -692,14 +692,21 @@ def test_start_publishes_discovery_availability_and_settings(tmp_path):
     assert f"{DISCOVERY_PREFIX}/switch/seestar-sync/dry_run/config" in disc
     assert f"{DISCOVERY_PREFIX}/switch/seestar-sync/reclaim_enabled/config" in disc
     assert f"{DISCOVERY_PREFIX}/text/seestar-sync/seestar_host/config" in disc
-    # every discovery payload shares the device block + availability topic
+    assert f"{DISCOVERY_PREFIX}/binary_sensor/seestar-sync/online/config" in disc
+    assert f"{DISCOVERY_PREFIX}/sensor/seestar-sync/version/config" in disc
+    # every discovery payload shares the device block; all but the liveness
+    # binary_sensor also share the availability topic (it must not grey
+    # itself out via the topic it reports)
     for topic, payload, retain in fake.published:
         if topic.startswith(DISCOVERY_PREFIX):
             body = json.loads(payload)
             assert retain is True
-            assert body["availability_topic"] == "seestar-sync/availability"
             assert body["device"]["identifiers"] == ["seestar-sync"]
             assert "unique_id" in body
+            if topic.endswith("/online/config"):
+                assert "availability_topic" not in body
+            else:
+                assert body["availability_topic"] == "seestar-sync/availability"
     # command subscriptions
     assert "seestar-sync/set/dry_run" in fake.subscribed
     assert "seestar-sync/set/reclaim_enabled" in fake.subscribed
@@ -1080,19 +1087,31 @@ class MqttReporter:
             "sw_version": _version(),
         }
 
-        def entity(component: str, object_id: str, extra: dict) -> None:
+        def entity(component: str, object_id: str, extra: dict,
+                   with_availability: bool = True) -> None:
             body = {
                 "unique_id": f"seestar-sync_{object_id}",
-                "availability_topic": self._topic("availability"),
                 "device": device,
                 **extra,
             }
+            if with_availability:
+                body["availability_topic"] = self._topic("availability")
             self._client.publish(
                 f"{DISCOVERY_PREFIX}/{component}/{self._prefix}/{object_id}/config",
                 json.dumps(body), retain=True,
             )
 
         summary_t = self._topic("summary")
+        # the alertable liveness entity (spec: "Daemon online" binary_sensor)
+        # reads the availability topic directly, so it must NOT grey itself
+        # out via that same topic — with_availability=False
+        entity("binary_sensor", "online", {
+            "name": "Daemon online",
+            "state_topic": self._topic("availability"),
+            "payload_on": "online",
+            "payload_off": "offline",
+            "device_class": "connectivity",
+        }, with_availability=False)
         entity("sensor", "state", {"name": "State", "state_topic": self._topic("state")})
         entity("sensor", "progress", {
             "name": "Progress", "unit_of_measurement": "%",
@@ -1110,7 +1129,7 @@ class MqttReporter:
             "json_attributes_topic": summary_t,
         })
         entity("sensor", "last_run", {
-            "name": "Last run", "device_class": "timestamp",
+            "name": "Last run time", "device_class": "timestamp",
             "state_topic": summary_t,
             "value_template": "{{ value_json.last_run }}",
         })
@@ -1119,11 +1138,15 @@ class MqttReporter:
             ("bytes_copied", "Bytes copied", "{{ value_json.bytes_copied }}"),
             ("files_deleted", "Files deleted", "{{ value_json.files_deleted }}"),
             ("bytes_reclaimed", "Bytes reclaimed", "{{ value_json.bytes_reclaimed }}"),
-            ("errors", "Errors", "{{ value_json.errors | length }}"),
         ):
             entity("sensor", object_id, {
                 "name": name, "state_topic": summary_t, "value_template": template,
             })
+        entity("sensor", "errors", {
+            "name": "Errors", "state_topic": summary_t,
+            "value_template": "{{ value_json.errors | length }}",
+            "json_attributes_topic": summary_t,  # spec: full list as attribute
+        })
         for key, name in (("dry_run", "Dry run"), ("reclaim_enabled", "Reclaim enabled")):
             entity("switch", key, {
                 "name": name,
@@ -1141,6 +1164,7 @@ class MqttReporter:
             ("sync_interval", "Sync interval (min)", str(self._config.sync_interval_minutes)),
             ("trigger_percent", "Reclaim trigger %", str(self._config.reclaim_trigger_percent)),
             ("target_percent", "Reclaim target %", str(self._config.reclaim_target_percent)),
+            ("version", "Version", _version()),
         ):
             entity("sensor", object_id, {
                 "name": name, "state_topic": self._topic(f"diag/{object_id}"),
