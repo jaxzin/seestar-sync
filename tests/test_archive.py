@@ -61,6 +61,34 @@ def test_short_read_raises_verify_error_and_leaves_no_part(tmp_path):
     assert not list((a.root / "MyWorks" / "M 81_sub").glob("*.part"))
 
 
+def test_write_stream_reports_cumulative_bytes(tmp_path):
+    a = make_archive(tmp_path)
+    a.init(allow_root_fs=False)
+    payload = b"x" * (1024 * 1024 * 3 + 512)  # 3 full chunks + a tail
+    seen: list[int] = []
+    a.write_stream(
+        "M 81_sub/big.fit", io.BytesIO(payload), len(payload), mtime=1000.0,
+        on_bytes=seen.append,
+    )
+    assert seen, "callback was never invoked"
+    assert seen == sorted(seen)  # cumulative, monotonic non-decreasing
+    assert seen[-1] == len(payload)  # final report is the full size
+    assert all(0 < b <= len(payload) for b in seen)
+    # one report per 1 MiB chunk (4 chunks: 3 full + tail), not per byte
+    assert len(seen) == 4
+
+
+def test_write_stream_without_callback_still_works(tmp_path):
+    a = make_archive(tmp_path)
+    a.init(allow_root_fs=False)
+    payload = b"abc" * 1000
+    sha = a.write_stream(
+        "M 81_sub/plain.fit", io.BytesIO(payload), len(payload), mtime=1000.0
+    )  # no on_bytes
+    assert a.dest_path("M 81_sub/plain.fit").exists()
+    assert sha == hashlib.sha256(payload).hexdigest()
+
+
 def test_dest_path_rejects_traversal(tmp_path):
     # device filenames are device-controlled input: contain them under MyWorks
     a = make_archive(tmp_path)

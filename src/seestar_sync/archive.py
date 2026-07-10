@@ -92,13 +92,24 @@ class Archive:
         return base / pure
 
     def write_stream(
-        self, device_path: str, reader: BinaryIO, expected_size: int, mtime: float
+        self,
+        device_path: str,
+        reader: BinaryIO,
+        expected_size: int,
+        mtime: float,
+        on_bytes: Callable[[int], None] | None = None,
     ) -> str:
         """Copy reader -> .part, verify size + sha256 by re-reading, atomic rename.
 
         Returns the sha256 hex digest. Raises VerifyError (and removes the
         .part) on any mismatch, so a torn or corrupted transfer is invisible
         to the archive.
+
+        on_bytes, if given, is called after each chunk lands with the cumulative
+        number of bytes written to the .part file so far (for live progress).
+        It is invoked only during the write pass, never the verify re-read, so
+        it reports real bytes-to-disk exactly once each. The caller owns
+        throttling/coalescing and must not raise.
         """
         dest = self.dest_path(device_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +123,8 @@ class Archive:
                     device_hash.update(chunk)
                     out.write(chunk)
                     written += len(chunk)
+                    if on_bytes is not None:
+                        on_bytes(written)  # cumulative; consumer coalesces/throttles
                 out.flush()
                 os.fsync(out.fileno())
 
