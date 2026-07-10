@@ -182,6 +182,15 @@ silently treated as an empty archive.
 All reporters are fire-and-forget: a reporter failure (network error, bad URL, etc.) is
 logged as a warning and never affects the run's exit code.
 
+## Security note
+
+The trust boundary is your LAN: the Seestar's guest SMB share gives *anyone on the
+network* full read/write/delete access to the telescope's storage — with or without this
+tool. This tool's SMB transfers are unsigned, because guest sessions cryptographically
+cannot sign (a device design constraint, not a configuration choice), so file integrity
+in transit is only as trustworthy as the network itself. Keep the telescope on a trusted
+network or its own VLAN.
+
 ## Design spec
 
 For the full design rationale (SMB client choice, manifest schema, safety properties,
