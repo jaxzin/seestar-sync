@@ -1,6 +1,6 @@
 [project]
 name = "seestar-sync"
-version = "0.2.1"
+version = "0.2.2"
 description = "Mirror Seestar S30 Pro media to a NAS over SMB and reclaim device space, keeping stacked JPGs on-device"
 readme = "README.md"
 license = "MIT"

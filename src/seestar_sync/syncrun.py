@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from .archive import Archive, VerifyError
@@ -174,6 +175,10 @@ def _copy_phase(
                     notify(ProgressEvent(
                         phase="copying", files_done=files_done, files_total=files_total,
                         bytes_done=cum, bytes_total=bytes_total, current_path=_f.path))
+                    # live "bytes copied so far" incl. the in-flight partial, so the
+                    # HA Bytes-copied sensor climbs THROUGH a big file, not just at
+                    # its completion. base == summary.bytes_copied at file start.
+                    report_summary(replace(summary, bytes_copied=cum))
                 t = time.monotonic()
                 if written < _f.size and t - emit_state["hb"] >= _COPY_HEARTBEAT_SECONDS:
                     emit_state["hb"] = t

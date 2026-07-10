@@ -382,6 +382,24 @@ def test_on_summary_reports_running_totals_during_copy(env):
     assert snaps[0][1] < snaps[1][1]  # bytes_copied strictly climbs
 
 
+def test_on_summary_climbs_through_a_large_file(env, monkeypatch):
+    # Bytes copied must climb continuously THROUGH a big file (including the
+    # in-flight partial), not jump only at file completion — the whole point of
+    # the fix for the 28 GB backlog video.
+    monkeypatch.setattr(syncrun, "_PROGRESS_COALESCE_BYTES", 2 * 1024 * 1024)
+    size = 9 * 1024 * 1024
+    archive, manifest = env
+    d = FakeDevice(capacity=10_000_000_000)
+    d.put("Solar_video/big.avi", b"z" * size, mtime=1.0)
+    snaps: list[int] = []
+    run_sync(d, archive, manifest, config(), now=1_000_000.0,
+             on_summary=lambda s: snaps.append(s.bytes_copied))
+    partial = [b for b in snaps if b < size]  # mid-file, in-flight snapshots
+    assert len(partial) >= 3, f"expected intra-file summary updates, got {snaps}"
+    assert snaps == sorted(snaps)  # monotonic climb
+    assert snaps[-1] == size  # finalizes at the true completed total
+
+
 def test_heartbeat_line_formats_and_guards_zero_size():
     from seestar_sync.syncrun import _heartbeat_line
 
