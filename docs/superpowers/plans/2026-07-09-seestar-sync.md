@@ -1880,6 +1880,45 @@ def test_verify_failure_counts_and_eventually_skips(env):
     assert manifest.failure_count(path) == 3
 
 
+def test_false_delete_audit_reconciles_next_run(env):
+    # crash state: write-ahead audit committed but the SMB delete never
+    # happened (spec: a false "deleted" must self-heal, never the reverse)
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000)
+    path = "M 81_sub/Light_a_20250101-000000.fit"
+    d.put(path, b"x" * 8000, mtime=1.0)
+    s1 = run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    assert s1.files_copied == 1 and s1.files_deleted == 0
+    from seestar_sync.syncrun import iso
+
+    manifest.mark_deleted(path, tier=1, deleted_at=iso(1_000_100.0))  # forged crash
+    d.capacity = 10_000  # now 80% used → reclaim pressure
+    s2 = run_sync(d, archive, manifest, config(), now=1_000_200.0)
+    assert s2.files_deleted == 1
+    assert d.list_files() == []  # reconciled: really deleted this time
+    assert manifest.get(path).deleted_from_device_at == iso(1_000_200.0)
+    assert archive.dest_path(path).exists()  # NAS copy untouched throughout
+
+
+def test_write_ahead_audit_commits_before_delete_issued(env):
+    # ordering asserted OBSERVABLY, not by end-state: the device refuses the
+    # delete unless the audit row is already committed
+    archive, manifest = env
+
+    class OrderCheckingDevice(FakeDevice):
+        def delete_file(self, path):
+            row = manifest.get(path)
+            assert row is not None and row.deleted_from_device_at is not None, (
+                "delete issued before write-ahead audit committed"
+            )
+            super().delete_file(path)
+
+    d = OrderCheckingDevice(capacity=1000)
+    d.put("M 81_sub/Light_a_20250101-000000.fit", b"x" * 800, mtime=1.0)
+    s = run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    assert s.files_deleted == 1
+
+
 def test_should_stop_bounds_shutdown_to_one_file(env):
     archive, manifest = env
     d = FakeDevice(capacity=100_000)
@@ -2078,7 +2117,7 @@ def _reclaim_phase(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_syncrun.py -v`
-Expected: 7 passed
+Expected: 10 passed
 
 - [ ] **Step 5: Run the whole suite**
 
