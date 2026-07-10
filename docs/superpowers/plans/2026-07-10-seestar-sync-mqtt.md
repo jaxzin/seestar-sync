@@ -647,8 +647,13 @@ class FakeClient:
     def disconnect(self):
         pass
 
+    class _MsgInfo:
+        def wait_for_publish(self, timeout=None):
+            pass
+
     def publish(self, topic, payload=None, qos=0, retain=False):
         self.published.append((topic, payload, retain))
+        return self._MsgInfo()
 
     def subscribe(self, topic, qos=0):
         self.subscribed.append(topic)
@@ -839,6 +844,39 @@ def test_publish_summary_retains_and_never_raises(tmp_path):
     rep.publish_summary(summary, effective, sources)  # must not raise
 
 
+def test_guard_warnings_fire_and_redact_readably(tmp_path, caplog):
+    # SDET: never-raise tests must assert the warning FIRED (a silent no-op
+    # can't masquerade as a caught failure), the secret is gone, and short
+    # non-secrets (username "u") don't turn the message into soup
+    import logging
+
+    from seestar_sync.settings import resolve_effective
+
+    rep, fake, _, config, store = make(tmp_path, MQTT_PASSWORD="hunter2secret")
+    rep.start()
+
+    def explode(*a, **k):
+        raise OSError("auth failed for hunter2secret while connecting")
+
+    fake.publish = explode
+    with caplog.at_level(logging.WARNING):
+        rep.publish_settings(*resolve_effective(config, store))
+    assert "settings publish failed" in caplog.text  # guard observably fired
+    assert "hunter2secret" not in caplog.text
+    assert "<redacted>" in caplog.text
+    assert "auth failed" in caplog.text  # username "u" didn't mangle the words
+
+
+def test_progress_percent_zero_total(tmp_path):
+    # division guard: a zero-byte plan must publish 0.0, not die silently
+    rep, fake, clock, *_ = make(tmp_path)
+    rep.start()
+    fake.published.clear()
+    rep.handle_progress(ProgressEvent(phase="done"))
+    prog = [p for p in fake.published if p[0] == "seestar-sync/progress"]
+    assert json.loads(prog[-1][1])["percent"] == 0.0
+
+
 def test_disabled_without_mqtt_host(tmp_path):
     env = {"SEESTAR_HOST": "seestar.local"}
     config = Config.from_env(env)
@@ -880,6 +918,7 @@ log = logging.getLogger(__name__)
 
 THROTTLE_SECONDS = 10.0
 DISCOVERY_PREFIX = "homeassistant"
+_MIN_REDACT_LEN = 4  # shorter "secrets" (e.g. username "u") aren't secrets
 
 _PHASE_TO_STATE = {
     "listing": "listing",
@@ -889,12 +928,12 @@ _PHASE_TO_STATE = {
 }
 
 
-def _paho_factory():
+def _paho_factory(client_id: str):
     import paho.mqtt.client as paho
 
     return paho.Client(
         callback_api_version=paho.CallbackAPIVersion.VERSION2,
-        client_id="seestar-sync",
+        client_id=client_id,
     )
 
 
@@ -921,7 +960,9 @@ class MqttReporter:
         if not self._config.mqtt_host:
             return  # feature disabled: v0.1 behavior
         try:
-            client = self._factory()
+            # client_id derives from the prefix so a second scope (different
+            # MQTT_TOPIC_PREFIX) doesn't kick this one off the broker
+            client = self._factory(self._prefix)
             if self._config.mqtt_username:
                 client.username_pw_set(
                     self._config.mqtt_username, self._config.mqtt_password
@@ -942,15 +983,26 @@ class MqttReporter:
         if self._client is None:
             return
         try:
-            self._publish("availability", "offline", retain=True)
-            self._client.loop_stop()
+            # Canonical paho shutdown order. loop_stop-first would kill the
+            # network thread with the offline packet still queued; the clean
+            # DISCONNECT then suppresses LWT and HA shows the dead daemon
+            # online forever. Flush the offline publish to the wire first.
+            info = self._client.publish(self._topic("availability"), "offline",
+                                        retain=True)
+            try:
+                info.wait_for_publish(timeout=2.0)
+            except Exception:  # noqa: BLE001 — best-effort flush
+                pass
             self._client.disconnect()
+            self._client.loop_stop()
         except Exception as e:  # noqa: BLE001
             log.warning("mqtt stop failed (non-fatal): %s", self._redact(e))
 
     # ---- publishing ------------------------------------------------------
 
     def handle_progress(self, event: ProgressEvent) -> None:
+        """Observer consumer: phase changes and `done` publish immediately;
+        otherwise ≥ THROTTLE_SECONDS apart (consumer-side throttling per spec)."""
         if self._client is None:
             return
         try:
@@ -1032,11 +1084,8 @@ class MqttReporter:
                     return
                 value: object = payload == "ON"
             elif key == "seestar_host":
-                if not payload:
-                    log.warning("mqtt: empty seestar_host rejected; re-echoing state")
-                    self._echo_current(key)
-                    return
-                value = payload
+                value = payload  # ALL host validation delegated to the store —
+                # one validation authority (rejects empty/whitespace/control)
             else:
                 log.warning("mqtt: command for unknown key %r ignored", key)
                 return
@@ -1046,8 +1095,8 @@ class MqttReporter:
             try:
                 self._store.set(key, value, iso(time.time()))
             except ValueError as e:
-                # validator rejected (e.g. whitespace host): targeted warning
-                # + re-echo so HA snaps back — spec §Failure isolation
+                # validator rejected: targeted warning + re-echo so HA snaps
+                # back — spec §Failure isolation
                 log.warning("mqtt: rejected %s command %r: %s", key, value, e)
                 self._echo_current(key)
                 return
@@ -1075,13 +1124,15 @@ class MqttReporter:
         msg = str(e)
         for secret in (self._config.mqtt_password, self._config.mqtt_username,
                        self._config.mqtt_host):
-            if secret and secret in msg:
+            # replacing ultra-short substrings turns messages into soup
+            # ("a<redacted>th failed") without hiding anything meaningful
+            if secret and len(secret) >= _MIN_REDACT_LEN and secret in msg:
                 msg = msg.replace(secret, "<redacted>")
         return msg
 
     def _publish_discovery(self) -> None:
         device = {
-            "identifiers": ["seestar-sync"],
+            "identifiers": [self._prefix],  # prefix-derived: second scopes coexist
             "name": "Seestar Sync",
             "manufacturer": "seestar-sync",
             "sw_version": _version(),
@@ -1090,7 +1141,7 @@ class MqttReporter:
         def entity(component: str, object_id: str, extra: dict,
                    with_availability: bool = True) -> None:
             body = {
-                "unique_id": f"seestar-sync_{object_id}",
+                "unique_id": f"{self._prefix}_{object_id}",
                 "device": device,
                 **extra,
             }
@@ -1185,7 +1236,7 @@ def _version() -> str:
 - [ ] **Step 5: Run tests**
 
 Run: `uv run pytest tests/test_mqtt.py -v`
-Expected: 9 passed. Full suite green.
+Expected: 11 passed. Full suite green.
 
 - [ ] **Step 6: Commit**
 
