@@ -916,8 +916,10 @@ class MqttReporter:
             client.on_message = self._on_message
             client.will_set(self._topic("availability"), "offline", retain=True)
             client.connect_async(self._config.mqtt_host, self._config.mqtt_port)
-            client.loop_start()  # paho reconnects automatically from here on
+            # assign BEFORE loop_start: paho's network thread can fire
+            # on_connect immediately, and the callbacks publish via self._client
             self._client = client
+            client.loop_start()  # paho reconnects automatically from here on
         except Exception as e:  # noqa: BLE001 — reporter must never raise
             log.warning("mqtt start failed (non-fatal): %s", self._redact(e))
             self._client = None
