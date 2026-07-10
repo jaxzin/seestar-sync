@@ -50,7 +50,10 @@ def run_sync(
     """
     now = time.time() if now is None else now
     should_stop = should_stop or (lambda: False)
-    summary = RunSummary(started_at=iso(now), result="ok", dry_run=config.dry_run)
+    summary = RunSummary(
+        started_at=iso(now), result="ok",
+        dry_run=config.dry_run, reclaim_enabled=config.reclaim_enabled,
+    )
 
     try:
         files = device.list_files()

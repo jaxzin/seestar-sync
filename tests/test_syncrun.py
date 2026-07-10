@@ -210,6 +210,8 @@ def test_reclaim_disabled_by_default_is_copy_only(env):
     assert len(d.list_files()) == 1  # nothing deleted
     assert s.device_used_percent == 80.0  # fill level still reported
     assert s.result == "ok"
+    assert s.reclaim_enabled is False  # machine-readable copy-only signal
+    assert s.to_json()["reclaim_enabled"] is False  # reaches status.json/HA
 
 
 def test_dry_run_touches_nothing(env):
