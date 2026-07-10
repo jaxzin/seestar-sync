@@ -45,3 +45,36 @@ def test_bool_parsing_accepts_common_truthy_values():
 def test_non_numeric_interval_is_fatal():
     with pytest.raises(ConfigError, match="SYNC_INTERVAL_MINUTES"):
         Config.from_env(base_env(SYNC_INTERVAL_MINUTES="soon"))
+
+
+def test_non_numeric_capacity_is_fatal():
+    with pytest.raises(ConfigError, match="DEVICE_CAPACITY_GB"):
+        Config.from_env(base_env(DEVICE_CAPACITY_GB="lots"))
+
+
+def test_non_positive_capacity_and_window_are_fatal():
+    with pytest.raises(ConfigError, match="DEVICE_CAPACITY_GB"):
+        Config.from_env(base_env(DEVICE_CAPACITY_GB="0"))
+    # the session guard is a delete-safety feature; it must never be disabled
+    with pytest.raises(ConfigError, match="ACTIVE_WINDOW_MINUTES"):
+        Config.from_env(base_env(ACTIVE_WINDOW_MINUTES="0"))
+
+
+def test_webhook_urls_must_be_http():
+    with pytest.raises(ConfigError, match="KUMA_PUSH_URL"):
+        Config.from_env(base_env(KUMA_PUSH_URL="file:///etc/passwd"))
+    cfg = Config.from_env(base_env(HA_WEBHOOK_URL="https://ha.local/api/webhook/x"))
+    assert cfg.ha_webhook_url == "https://ha.local/api/webhook/x"
+
+
+def test_garbage_bool_is_fatal():
+    for raw in ("0", "no", "off"):
+        assert Config.from_env(base_env(DRY_RUN=raw)).dry_run is False
+    with pytest.raises(ConfigError, match="DRY_RUN"):
+        Config.from_env(base_env(DRY_RUN="maybe"))
+
+
+def test_non_positive_interval_is_fatal():
+    for raw in ("0", "-5"):
+        with pytest.raises(ConfigError, match="SYNC_INTERVAL_MINUTES"):
+            Config.from_env(base_env(SYNC_INTERVAL_MINUTES=raw))
