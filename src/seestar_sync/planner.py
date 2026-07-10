@@ -19,4 +19,6 @@ def plan_copies(
     todo = [
         f for f in files if top_folder(f.path) not in active and not is_synced(f)
     ]
-    return sorted(todo, key=session_key)
+    # path tiebreaker keeps plans deterministic when timestamps tie —
+    # dry-run output must be stable run-to-run for operator review
+    return sorted(todo, key=lambda f: (session_key(f), f.path))
