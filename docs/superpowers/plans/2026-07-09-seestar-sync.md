@@ -101,7 +101,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 dist/
+.env
 ```
+
+(`.env` matters: the README instructs operators to put webhook/push URLs — quasi-secrets with embedded tokens — in `.env`; it must never be committable.)
 
 Ensure `src/seestar_sync/__init__.py` exists and is empty (delete any `uv init` sample code like `py.typed` demo functions; keep `py.typed` if generated). Delete any generated sample test. Create a stub `README.md` (just `# seestar-sync` + one sentence) — pyproject's `readme` field makes the build fail on a fresh clone without it; Task 12 replaces its content at the same path. Keep and commit `.python-version` (it's a reproducibility pin).
 
@@ -3020,7 +3023,10 @@ And `.dockerignore`:
 tests/
 docs/
 __pycache__/
+.env
 ```
+
+(`.env` holds push tokens; nothing COPYs it today, but the build context ships to the builder — keep it out as insurance against future Dockerfile edits.)
 
 - [ ] **Step 2: Write `docker-compose.yml`** (Mac iteration; NAS/k8s later reuse the same image)
 
