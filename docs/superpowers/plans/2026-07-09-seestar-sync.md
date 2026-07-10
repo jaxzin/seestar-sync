@@ -1102,6 +1102,8 @@ def test_fake_lists_stats_and_reads():
     assert d.open_read("M 81_sub/a.fit").read() == b"12345"
     with pytest.raises(FileNotFoundError):
         d.stat("nope.fit")
+    with pytest.raises(FileNotFoundError):
+        d.open_read("nope.fit")  # same contract as production (app-side drift)
 
 
 def test_fake_disk_usage_tracks_deletes():
@@ -1121,6 +1123,26 @@ def test_fake_can_simulate_mid_run_disconnect():
     d.open_read("a/x.fit")  # first read fine
     with pytest.raises(DeviceUnavailable):
         d.open_read("a/y.fit")
+
+
+def test_fake_delete_contract_and_full_disconnect():
+    # delete matches production (FileNotFoundError on missing); the
+    # `disconnected` flag fails every op — needed for batch D's
+    # audit-committed-but-delete-never-issued reconciliation test
+    d = FakeDevice(capacity=100)
+    d.put("a/x.fit", b"x", mtime=0.0)
+    with pytest.raises(FileNotFoundError):
+        d.delete_file("a/ghost.fit")
+    d.disconnected = True
+    for op in (
+        lambda: d.delete_file("a/x.fit"),
+        lambda: d.stat("a/x.fit"),
+        lambda: d.list_files(),
+        lambda: d.open_read("a/x.fit"),
+        lambda: d.disk_usage(),
+    ):
+        with pytest.raises(DeviceUnavailable):
+            op()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1160,15 +1182,19 @@ class DeviceClient(Protocol):
         ...
 
     def open_read(self, path: str) -> BinaryIO:
-        """Streaming read. Raises DeviceUnavailable."""
+        """Streaming read. Raises FileNotFoundError or DeviceUnavailable."""
         ...
 
     def delete_file(self, path: str) -> None:
-        """Raises DeviceUnavailable."""
+        """Raises FileNotFoundError if the path is already gone (app-side
+        drift), DeviceUnavailable on connectivity loss."""
         ...
 
     def remove_dir_if_empty(self, folder: str) -> bool:
-        """Remove a now-empty top-level folder; False if non-empty/missing."""
+        """Best-effort cosmetic cleanup. True when the folder is gone
+        (removed or already absent); False when non-empty or removal failed.
+        Implementations may differ on edge cases — callers must not rely on
+        the return value for correctness."""
         ...
 
     def disk_usage(self) -> DiskUsage:
@@ -1195,26 +1221,36 @@ class FakeDevice:
         self._files: dict[str, tuple[bytes, float]] = {}
         self.fail_after_reads: int | None = None
         self.short_read_paths: set[str] = set()
+        self.disconnected = False  # flip mid-test to simulate power-off for ALL ops
         self._reads = 0
+
+    def _check_connection(self) -> None:
+        if self.disconnected:
+            raise DeviceUnavailable("simulated disconnect")
 
     def put(self, path: str, data: bytes = b"x" * 10, mtime: float = 0.0) -> None:
         self._files[path] = (data, mtime)
 
     def list_files(self) -> list[DeviceFile]:
+        self._check_connection()
         return [
             DeviceFile(path, len(data), mtime)
             for path, (data, mtime) in sorted(self._files.items())
         ]
 
     def stat(self, path: str) -> DeviceFile:
+        self._check_connection()
         if path not in self._files:
             raise FileNotFoundError(path)
         data, mtime = self._files[path]
         return DeviceFile(path, len(data), mtime)
 
     def open_read(self, path: str) -> io.BytesIO:
+        self._check_connection()
         if self.fail_after_reads is not None and self._reads >= self.fail_after_reads:
             raise DeviceUnavailable("simulated mid-run power-off")
+        if path not in self._files:
+            raise FileNotFoundError(path)  # match production contract (app-side drift)
         self._reads += 1
         data, _ = self._files[path]
         if path in self.short_read_paths:
@@ -1222,13 +1258,17 @@ class FakeDevice:
         return io.BytesIO(data)
 
     def delete_file(self, path: str) -> None:
-        self._files.pop(path, None)
+        self._check_connection()
+        if path not in self._files:
+            raise FileNotFoundError(path)  # match production (smbclient.remove)
+        del self._files[path]
 
     def remove_dir_if_empty(self, folder: str) -> bool:
         prefix = folder + "/"
         return not any(p.startswith(prefix) for p in self._files)
 
     def disk_usage(self) -> DiskUsage:
+        self._check_connection()
         used = sum(len(data) for data, _ in self._files.values())
         return DiskUsage(total_bytes=self.capacity, free_bytes=self.capacity - used)
 ```
@@ -1242,7 +1282,7 @@ touch tests/__init__.py
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_fakes.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 6: Commit**
 
@@ -1321,7 +1361,9 @@ def plan_copies(
     todo = [
         f for f in files if top_folder(f.path) not in active and not is_synced(f)
     ]
-    return sorted(todo, key=session_key)
+    # path tiebreaker keeps plans deterministic when timestamps tie —
+    # dry-run output must be stable run-to-run for operator review
+    return sorted(todo, key=lambda f: (session_key(f), f.path))
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1479,7 +1521,8 @@ def plan_reclaim(
             continue  # never delete without a verified NAS copy
         candidates.append(Deletion(f, tier))
 
-    candidates.sort(key=lambda d: (d.tier, session_key(d.file)))
+    # path tiebreaker keeps deletion plans deterministic when timestamps tie
+    candidates.sort(key=lambda d: (d.tier, session_key(d.file), d.file.path))
 
     plan: list[Deletion] = []
     freed = 0
@@ -1535,7 +1578,14 @@ def summary(result="ok"):
 def test_write_status_snapshot(tmp_path):
     write_status(tmp_path, summary())
     data = json.loads((tmp_path / "status.json").read_text())
+    # exact spec contract — this JSON is also the HA webhook payload
+    assert set(data) == {
+        "last_run", "result", "dry_run", "files_copied", "bytes_copied",
+        "files_deleted", "bytes_reclaimed", "device_used_percent",
+        "active_folders_skipped", "errors",
+    }
     assert data["result"] == "ok"
+    assert data["files_copied"] == 2
     assert data["last_run"] == "2026-07-09T09:15:03Z"
 
 
@@ -1545,6 +1595,50 @@ def test_append_history_monthly_jsonl(tmp_path):
     lines = (tmp_path / "history" / "2026-07.jsonl").read_text().splitlines()
     assert len(lines) == 2
     assert json.loads(lines[1])["result"] == "partial"
+
+
+def test_kuma_pings_only_on_ok_results(monkeypatch):
+    # the dead-man-switch contract: failed runs must NOT ping, so Kuma
+    # alerts on the resulting silence
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    calls: list[str] = []
+
+    def fake_urlopen(url, timeout=None):
+        calls.append(url)
+        return _Resp()
+
+    monkeypatch.setattr("seestar_sync.reporters.urllib.request.urlopen", fake_urlopen)
+    from seestar_sync.reporters import ping_kuma
+
+    url = "http://kuma.local/api/push/token123"
+    ping_kuma(url, summary(result="ok"))
+    ping_kuma(url, summary(result="skipped_unreachable"))
+    ping_kuma(url, summary(result="partial"))
+    ping_kuma(url, summary(result="error"))
+    assert len(calls) == 2
+    assert all("status=up" in c for c in calls)
+
+
+def test_guard_redacts_urls_from_warnings(tmp_path, monkeypatch, caplog):
+    import logging
+
+    url = "http://kuma.local/api/push/SECRETTOKEN123"
+
+    def explode(u, timeout=None):
+        raise ValueError(f"unknown url type: {u!r}")
+
+    monkeypatch.setattr("seestar_sync.reporters.urllib.request.urlopen", explode)
+    cfg = Config.from_env({"SEESTAR_HOST": "h", "KUMA_PUSH_URL": url})
+    with caplog.at_level(logging.WARNING):
+        report_all(cfg, tmp_path, summary())
+    assert "SECRETTOKEN123" not in caplog.text
+    assert "<redacted-url>" in caplog.text
 
 
 def test_reporters_never_raise(tmp_path, monkeypatch):
@@ -1594,7 +1688,14 @@ def _guard(name: str, fn, *args) -> None:
     try:
         fn(*args)
     except Exception as e:  # noqa: BLE001 — reporters must never raise
-        log.warning("reporter %s failed (non-fatal): %s", name, e)
+        # Push/webhook URLs carry secret tokens and some exceptions echo
+        # their input (e.g. urllib's "unknown url type: '<url>'") — redact
+        # any string argument from the logged text.
+        msg = str(e)
+        for arg in args:
+            if isinstance(arg, str) and arg and arg in msg:
+                msg = msg.replace(arg, "<redacted-url>")
+        log.warning("reporter %s failed (non-fatal): %s", name, msg)
 
 
 def write_status(meta_dir: Path, summary: RunSummary) -> None:
@@ -1646,7 +1747,7 @@ def report_all(config: Config, meta_dir: Path, summary: RunSummary) -> None:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_reporters.py -v`
-Expected: 3 passed
+Expected: 5 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1955,7 +2056,13 @@ def _reclaim_phase(
                 log.warning("skipping delete of %s: changed since verification", d.file.path)
                 continue
             manifest.mark_deleted(d.file.path, int(d.tier), iso(now))  # write-ahead
-            device.delete_file(d.file.path)
+            try:
+                device.delete_file(d.file.path)
+            except FileNotFoundError:
+                # vanished between stat and delete (app-side drift); the
+                # audit row stands — self-healing false-delete, don't count
+                log.debug("%s vanished before delete; audit stands", d.file.path)
+                continue
             summary.files_deleted += 1
             summary.bytes_reclaimed += d.file.size
             log.info("deleted [tier %d] %s (%d bytes)", d.tier, d.file.path, d.file.size)
