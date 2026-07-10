@@ -120,7 +120,7 @@ when the daemon dies (LWT) — HA-visible daemon liveness without polling.
 |---|---|---|
 | `MQTT_HOST` | *(unset = MQTT disabled)* | Broker hostname |
 | `MQTT_PORT` | `1883` | Broker port |
-| `MQTT_USERNAME` / `MQTT_PASSWORD` | *(unset)* | Broker auth (password is a secret: .env only, never logged) |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | *(unset)* | Broker auth (password is a secret: .env only, never logged). `MQTT_USERNAME` is required whenever `MQTT_HOST` is set — enforced at startup (architect-ruled: the command surface can enable deletion, so credential-less config fails fast). Note the client cannot verify the broker *enforces* auth; the never-anonymous-broker rule remains operational guidance |
 | `MQTT_TOPIC_PREFIX` | `seestar-sync` | Topic root + discovery node id |
 
 `HA_WEBHOOK_URL` and `post_ha_webhook` are removed (never deployed; Kuma and
