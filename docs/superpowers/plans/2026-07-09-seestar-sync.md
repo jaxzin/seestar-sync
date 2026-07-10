@@ -2867,7 +2867,7 @@ seestar-sync = "seestar_sync.cli:entrypoint"
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_cli.py -v`
-Expected: 7 passed
+Expected: 8 passed
 
 - [ ] **Step 5: Run the whole suite**
 
