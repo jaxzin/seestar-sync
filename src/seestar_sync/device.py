@@ -27,15 +27,19 @@ class DeviceClient(Protocol):
         ...
 
     def open_read(self, path: str) -> BinaryIO:
-        """Streaming read. Raises DeviceUnavailable."""
+        """Streaming read. Raises FileNotFoundError or DeviceUnavailable."""
         ...
 
     def delete_file(self, path: str) -> None:
-        """Raises DeviceUnavailable."""
+        """Raises FileNotFoundError if the path is already gone (app-side
+        drift), DeviceUnavailable on connectivity loss."""
         ...
 
     def remove_dir_if_empty(self, folder: str) -> bool:
-        """Remove a now-empty top-level folder; False if non-empty/missing."""
+        """Best-effort cosmetic cleanup. True when the folder is gone
+        (removed or already absent); False when non-empty or removal failed.
+        Implementations may differ on edge cases — callers must not rely on
+        the return value for correctness."""
         ...
 
     def disk_usage(self) -> DiskUsage:
