@@ -675,7 +675,8 @@ def make(tmp_path, **env_over):
     store = SettingsStore(tmp_path / "settings.json")
     fake = FakeClient()
     clock = FakeClock()
-    rep = MqttReporter(config, store, client_factory=lambda: fake, clock=clock)
+    # factory takes the client_id arg (prefix-derived identity)
+    rep = MqttReporter(config, store, client_factory=lambda *a: fake, clock=clock)
     return rep, fake, clock, config, store
 
 
@@ -881,7 +882,7 @@ def test_disabled_without_mqtt_host(tmp_path):
     env = {"SEESTAR_HOST": "seestar.local"}
     config = Config.from_env(env)
     store = SettingsStore(tmp_path / "settings.json")
-    rep = MqttReporter(config, store, client_factory=lambda: FakeClient())
+    rep = MqttReporter(config, store, client_factory=lambda *a: FakeClient())
     rep.start()  # no-op, no client created
     rep.handle_progress(ProgressEvent(phase="copying"))
     rep.stop()  # all safe no-ops
