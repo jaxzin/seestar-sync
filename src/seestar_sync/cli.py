@@ -55,7 +55,10 @@ def _one_run(config: Config, archive: Archive, device_factory,
     effective, sources = resolve_effective(config, store)
     for key in OVERRIDE_KEYS:
         if sources[key] == "mqtt override":
-            log.warning("effective %s comes from MQTT override", key)
+            # INFO, not WARNING: a persistent override is steady-state, and
+            # ~300 WARNING lines/day dilutes the warning signal. The
+            # write-time audit in mqtt.py stays WARNING (that's the event).
+            log.info("effective %s comes from MQTT override", key)
     from .device import DeviceUnavailable
 
     observer = mqtt.handle_progress if mqtt is not None else None
@@ -119,8 +122,9 @@ def _cmd_daemon(config: Config, args, device_factory) -> int:
                 log.warning("run finished with errors (exit %d); continuing", code)
             stop.wait(interval)  # interruptible, unlike time.sleep
     finally:
-        # must run even when ArchiveError propagates out of a pass — LWT
-        # otherwise leaves HA showing the dead daemon online forever
+        # must run even when ArchiveError propagates out of a pass: publishes
+        # a clean retained "offline" immediately (rather than waiting on the
+        # broker to detect the drop and fire LWT) and stops paho's thread
         if mqtt is not None:
             mqtt.stop()
     return 0
