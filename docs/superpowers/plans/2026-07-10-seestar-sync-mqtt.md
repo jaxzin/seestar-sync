@@ -115,9 +115,13 @@ Replace the `ha_webhook_url: str | None` dataclass field with:
     mqtt_host: str | None
     mqtt_port: int
     mqtt_username: str | None
-    mqtt_password: str | None
+    mqtt_password: str | None = dataclasses.field(repr=False)  # never in tracebacks
     mqtt_topic_prefix: str
 ```
+
+(add `import dataclasses` to config.py's imports; the field has no default —
+`repr=False` only. Python permits `field(repr=False)` without a default in a
+frozen dataclass as long as later fields also lack defaults, which holds here.)
 
 In `from_env`, replace `ha_webhook_url=_http_url(env, "HA_WEBHOOK_URL"),` with `# (HA webhook removed in v0.2 — MQTT replaces it; Kuma stays)` and add before the `return cls(...)`:
 
@@ -398,6 +402,8 @@ def test_set_rejects_unknown_keys_and_wrong_types(tmp_path):
         store.set("dry_run", "yes", "t")  # must be bool, not str
     with pytest.raises(ValueError, match="seestar_host"):
         store.set("seestar_host", "", "t")  # nonempty string required
+    with pytest.raises(ValueError, match="seestar_host"):
+        store.set("seestar_host", "bad host", "t")  # no whitespace/control chars
 
 
 def test_corrupt_file_falls_back_to_empty(tmp_path):
@@ -460,7 +466,12 @@ OVERRIDE_KEYS = ("dry_run", "reclaim_enabled", "seestar_host")
 _VALIDATORS = {
     "dry_run": lambda v: isinstance(v, bool),
     "reclaim_enabled": lambda v: isinstance(v, bool),
-    "seestar_host": lambda v: isinstance(v, str) and v.strip() != "",
+    # printable, no whitespace/control chars: junk can't reach register_session
+    "seestar_host": lambda v: (
+        isinstance(v, str)
+        and v != ""
+        and all(ch.isprintable() and not ch.isspace() for ch in v)
+    ),
 }
 
 
