@@ -1356,6 +1356,56 @@ def test_mid_pass_override_does_not_half_apply(tmp_path):
                 / "Light_c_20250103-000000.fit").exists()  # next pass: dry run
 
 
+def test_one_run_wires_mqtt_observer_and_summary(tmp_path):
+    # the feature's delivery path: observer events flow through _one_run and
+    # publish_summary fires exactly once per pass — INCLUDING the
+    # factory-unreachable branch (what keeps HA's last-result sensor honest
+    # on nights the telescope is off)
+    from seestar_sync.archive import Archive
+    from seestar_sync.cli import _one_run
+    from seestar_sync.config import Config
+    from seestar_sync.device import DeviceUnavailable
+
+    class StubMqtt:
+        def __init__(self):
+            self.events = []
+            self.summaries = []
+
+        def handle_progress(self, event):
+            self.events.append(event)
+
+        def publish_summary(self, summary, effective, sources):
+            self.summaries.append((summary, effective, sources))
+
+    root = tmp_path / "archive"
+    root.mkdir()
+    cfg = Config.from_env(
+        {"SEESTAR_HOST": "h", "ARCHIVE_DIR": str(root), "ARCHIVE_ON_ROOT_FS_OK": "true"}
+    )
+    archive = Archive(root)
+    archive.init(allow_root_fs=True)
+
+    d = FakeDevice()
+    d.put("M 81_sub/Light_a_20250101-000000.fit", b"data", mtime=1.0)
+    mqtt = StubMqtt()
+    assert _one_run(cfg, archive, lambda c: d, mqtt=mqtt) == 0
+    assert mqtt.events[0].phase == "listing"
+    assert mqtt.events[-1].phase == "done"
+    assert len(mqtt.summaries) == 1
+    summary, effective, sources = mqtt.summaries[0]
+    assert summary.result == "ok"
+    assert set(sources) == {"dry_run", "reclaim_enabled", "seestar_host"}
+
+    def dead_factory(c):
+        raise DeviceUnavailable("off")
+
+    mqtt2 = StubMqtt()
+    assert _one_run(cfg, archive, dead_factory, mqtt=mqtt2) == 0
+    assert mqtt2.events == []  # no pass ran
+    assert len(mqtt2.summaries) == 1
+    assert mqtt2.summaries[0][0].result == "skipped_unreachable"
+
+
 def test_third_party_loggers_quieted(tmp_path):
     import logging
 
@@ -1463,7 +1513,7 @@ In `_cmd_status`, after the existing prints, add:
 - [ ] **Step 4: Run tests**
 
 Run: `uv run pytest tests/test_cli.py -v`
-Expected: 17 passed. Full suite green.
+Expected: 18 passed. Full suite green.
 
 - [ ] **Step 5: Commit**
 
