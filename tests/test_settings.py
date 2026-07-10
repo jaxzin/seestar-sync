@@ -44,6 +44,8 @@ def test_corrupt_file_falls_back_to_empty(tmp_path):
     assert SettingsStore(p).load() == {}
     p.write_text(json.dumps({"reclaim_enabled": {"value": "banana", "modified_at": "t"}}))
     assert SettingsStore(p).load() == {}  # wrong type inside is dropped too
+    p.write_text(json.dumps({"seestar_host": {"value": "evil host", "modified_at": "t"}}))
+    assert SettingsStore(p).load() == {}  # whitespace host dropped at LOAD too
 
 
 def test_resolve_effective_precedence_and_sources(tmp_path):
