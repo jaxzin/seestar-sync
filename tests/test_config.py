@@ -118,8 +118,14 @@ def test_mqtt_validation_is_fatal():
         Config.from_env(base_env(MQTT_USERNAME="u"))  # auth without host
     with pytest.raises(ConfigError, match="MQTT_USERNAME"):
         Config.from_env(base_env(MQTT_HOST="h", MQTT_PASSWORD="p"))
+    with pytest.raises(ConfigError, match="credentials are required"):
+        Config.from_env(base_env(MQTT_HOST="h"))  # host alone: no anonymous brokers
     with pytest.raises(ConfigError, match="MQTT_TOPIC_PREFIX"):
-        Config.from_env(base_env(MQTT_HOST="h", MQTT_TOPIC_PREFIX="a/b"))
+        # credentials present so the check under test is the one that fires
+        Config.from_env(base_env(
+            MQTT_HOST="h", MQTT_USERNAME="u", MQTT_PASSWORD="p",
+            MQTT_TOPIC_PREFIX="a/b",
+        ))
 
 
 def test_ha_webhook_url_is_gone():

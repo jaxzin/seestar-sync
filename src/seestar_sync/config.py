@@ -117,6 +117,14 @@ class Config:
             raise ConfigError("MQTT_USERNAME/MQTT_PASSWORD set but MQTT_HOST is not")
         if mqtt_password and not mqtt_username:
             raise ConfigError("MQTT_PASSWORD set without MQTT_USERNAME")
+        if mqtt_host and not mqtt_username:
+            # architect-ruled: the MQTT command surface can enable deletion,
+            # so a credential-less broker connection fails fast at startup
+            raise ConfigError(
+                "MQTT_HOST is set but MQTT_USERNAME is not — the MQTT command "
+                "surface can enable deletion, so broker credentials are "
+                "required (Mosquitto add-on: create a dedicated user)"
+            )
         mqtt_topic_prefix = env.get("MQTT_TOPIC_PREFIX", "seestar-sync").strip()
         if not mqtt_topic_prefix or any(c in mqtt_topic_prefix for c in "/#+"):
             raise ConfigError(
