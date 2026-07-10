@@ -2998,7 +2998,9 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 COPY src/ src/
 COPY README.md ./
-RUN uv sync --frozen --no-dev
+# --no-editable is load-bearing: the final stage copies only .venv, so an
+# editable install (.pth -> /app/src) would ModuleNotFoundError at runtime
+RUN uv sync --frozen --no-dev --no-editable
 
 FROM python:3.12-slim-bookworm
 COPY --from=build /app/.venv /app/.venv
