@@ -1451,7 +1451,10 @@ def _one_run(config: Config, archive: Archive, device_factory,
     effective, sources = resolve_effective(config, store)
     for key in OVERRIDE_KEYS:
         if sources[key] == "mqtt override":
-            log.warning("effective %s comes from MQTT override", key)
+            # INFO, not WARNING: a persistent override is steady-state, and
+            # ~300 WARNING lines/day dilutes the warning signal. The
+            # write-time audit in mqtt.py stays WARNING (that's the event).
+            log.info("effective %s comes from MQTT override", key)
     from .device import DeviceUnavailable
 
     observer = mqtt.handle_progress if mqtt is not None else None
