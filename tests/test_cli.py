@@ -113,7 +113,9 @@ def test_status_subcommand(tmp_path, capsys):
     d = FakeDevice()
     run_cli(tmp_path, "run", "--init", device=d)
     assert run_cli(tmp_path, "status") == 0
-    assert "result: ok" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "result: ok" in out
+    assert "(copy-only)" in out  # RECLAIM_ENABLED defaults false → copy-only mode
 
 
 def test_rebuild_manifest(tmp_path):

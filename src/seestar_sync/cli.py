@@ -57,7 +57,8 @@ def _one_run(config: Config, archive: Archive, device_factory, should_stop=None)
         from .models import RunSummary
 
         summary = RunSummary(started_at=iso(time.time()), result="skipped_unreachable",
-                             dry_run=config.dry_run)
+                             dry_run=config.dry_run,
+                             reclaim_enabled=config.reclaim_enabled)
         report_all(config, archive.meta_dir, summary)
         return 0
     with Manifest(archive.meta_dir / "manifest.db") as manifest:
@@ -105,7 +106,10 @@ def _cmd_status(config: Config, args, device_factory) -> int:
         return 0
     data = json.loads(status_path.read_text())
     print(f"last run: {data['last_run']}")
-    print(f"result: {data['result']}" + ("  (dry run)" if data.get("dry_run") else ""))
+    mode = ("  (dry run)" if data.get("dry_run") else "") + (
+        "  (copy-only)" if not data.get("reclaim_enabled") else ""
+    )
+    print(f"result: {data['result']}{mode}")
     print(f"copied: {data['files_copied']} files / {data['bytes_copied']:,} bytes")
     print(f"reclaimed: {data['files_deleted']} files / {data['bytes_reclaimed']:,} bytes")
     if data.get("device_used_percent") is not None:
