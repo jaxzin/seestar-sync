@@ -821,7 +821,7 @@ class Manifest:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_manifest.py -v`
-Expected: 8 passed
+Expected: 7 passed
 
 - [ ] **Step 5: Commit**
 
