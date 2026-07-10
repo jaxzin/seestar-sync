@@ -34,6 +34,8 @@ def test_set_rejects_unknown_keys_and_wrong_types(tmp_path):
         store.set("dry_run", "yes", "t")  # must be bool, not str
     with pytest.raises(ValueError, match="seestar_host"):
         store.set("seestar_host", "", "t")  # nonempty string required
+    with pytest.raises(ValueError, match="seestar_host"):
+        store.set("seestar_host", "bad host", "t")  # no whitespace/control chars
 
 
 def test_corrupt_file_falls_back_to_empty(tmp_path):

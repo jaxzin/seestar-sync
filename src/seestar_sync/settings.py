@@ -24,7 +24,12 @@ OVERRIDE_KEYS = ("dry_run", "reclaim_enabled", "seestar_host")
 _VALIDATORS = {
     "dry_run": lambda v: isinstance(v, bool),
     "reclaim_enabled": lambda v: isinstance(v, bool),
-    "seestar_host": lambda v: isinstance(v, str) and v.strip() != "",
+    # printable, no whitespace/control chars: junk can't reach register_session
+    "seestar_host": lambda v: (
+        isinstance(v, str)
+        and v != ""
+        and all(ch.isprintable() and not ch.isspace() for ch in v)
+    ),
 }
 
 
