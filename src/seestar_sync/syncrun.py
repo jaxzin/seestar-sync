@@ -38,6 +38,13 @@ _PROGRESS_COALESCE_BYTES = 64 * 1024 * 1024
 _COPY_HEARTBEAT_SECONDS = 15.0
 
 
+def _heartbeat_line(path: str, written: int, size: int) -> str:
+    """Operator log line for an in-flight copy. size==0 can't happen in practice
+    (a 0-byte file never enters the write loop), but the guard keeps it total."""
+    pct = int(100 * written / size) if size else 100
+    return f"copying {path}: {written / 1e9:.1f}/{size / 1e9:.1f} GB ({pct}%)"
+
+
 def iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -147,24 +154,30 @@ def _copy_phase(
         emit_state = {"last": base, "hb": time.monotonic()}
 
         def _tick(written: int, _f=f) -> None:
-            cum = base + written
-            if cum - emit_state["last"] >= _PROGRESS_COALESCE_BYTES:
-                emit_state["last"] = cum
-                notify(ProgressEvent(
-                    phase="copying", files_done=files_done, files_total=files_total,
-                    bytes_done=cum, bytes_total=bytes_total, current_path=_f.path))
-            t = time.monotonic()
-            if written < _f.size and t - emit_state["hb"] >= _COPY_HEARTBEAT_SECONDS:
-                emit_state["hb"] = t
-                pct = int(100 * written / _f.size) if _f.size else 100
-                log.info("copying %s: %.1f/%.1f GB (%d%%)", _f.path,
-                         written / 1e9, _f.size / 1e9, pct)
+            # This runs inside write_stream's teardown-on-exception scope, where a
+            # raise would unlink the .part and abort the transfer. Telemetry must
+            # never corrupt a copy, so swallow any reporter/observer fault here.
+            try:
+                cum = base + written
+                if cum - emit_state["last"] >= _PROGRESS_COALESCE_BYTES:
+                    emit_state["last"] = cum
+                    notify(ProgressEvent(
+                        phase="copying", files_done=files_done, files_total=files_total,
+                        bytes_done=cum, bytes_total=bytes_total, current_path=_f.path))
+                t = time.monotonic()
+                if written < _f.size and t - emit_state["hb"] >= _COPY_HEARTBEAT_SECONDS:
+                    emit_state["hb"] = t
+                    log.info("%s", _heartbeat_line(_f.path, written, _f.size))
+            except Exception:  # noqa: BLE001 — telemetry must not fail a copy
+                log.debug("progress reporting raised; copy continues", exc_info=True)
 
         try:
             with device.open_read(f.path) as reader:
                 sha = archive.write_stream(f.path, reader, f.size, f.mtime, on_bytes=_tick)
         except FileNotFoundError:
-            log.debug("%s vanished before copy (app-side removal); normal drift", f.path)
+            # INFO (not debug) so the "copying %s" start line above always has a
+            # visible outcome; app-side deletion between inventory and copy is drift.
+            log.info("%s vanished before copy (app-side removal); skipping", f.path)
             continue
         except DeviceUnavailable as e:
             log.info("device vanished mid-copy (%s), keeping progress", e)

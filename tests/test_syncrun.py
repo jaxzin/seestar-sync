@@ -311,13 +311,71 @@ def test_intrafile_progress_emits_growing_bytes_done(env, monkeypatch):
     copying = [e for e in obs.events
                if e.phase == "copying" and e.current_path == "Solar_video/big.avi"]
     mid = [e for e in copying if e.bytes_done < size]  # strictly-partial emits
-    assert len(mid) >= 3, f"expected multiple intra-file emits, got {len(mid)}"
+    # 9 MiB file, 2 MiB coalesce threshold -> emits cross at 2/4/6/8 MiB = exactly
+    # 4 partial events. Exact count catches coalescing being removed (would give 8)
+    # or its threshold drifting, not just "no mid-file emits at all".
+    assert len(mid) == 4, f"expected 4 coalesced intra-file emits, got {len(mid)}"
     seq = [e.bytes_done for e in copying]
     assert seq == sorted(seq)  # monotonic non-decreasing across the whole copy
     # files_done stays 0 until the file completes; the final copying event is the
     # post-copy one (bytes fully banked, file counted)
     assert all(e.files_done == 0 for e in mid)
     assert copying[-1].bytes_done == size and copying[-1].files_done == 1
+
+
+def test_intrafile_progress_carries_bytes_across_files(env, monkeypatch):
+    # the feature's core promise: bytes_done = completed files + partial. For the
+    # second file, mid-copy emits must include the first file's bytes (base
+    # snapshot), not restart from 0 — a dropped base would make the HA bar jump
+    # backward at each file boundary.
+    monkeypatch.setattr(syncrun, "_PROGRESS_COALESCE_BYTES", 2 * 1024 * 1024)
+    mib = 1024 * 1024
+    archive, manifest = env
+    d = FakeDevice(capacity=10_000_000_000)  # roomy: no reclaim pressure
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * (5 * mib), mtime=1.0)
+    d.put("B_sub/Light_b_20250102-000000.fit", b"b" * (5 * mib), mtime=1.0)
+    obs = RecordingObserver()
+    run_sync(d, archive, manifest, config(), now=1_000_000.0, observer=obs)
+
+    copying = [e for e in obs.events if e.phase == "copying"]
+    seq = [e.bytes_done for e in copying]
+    assert seq == sorted(seq)  # monotonic across the file boundary
+    # the second file (files_done == 1) has mid-copy emits above the 5 MiB base
+    second = [e for e in copying
+              if e.files_done == 1 and 5 * mib < e.bytes_done < 10 * mib]
+    assert second, "second file's emits did not carry the first file's bytes"
+
+
+def test_observer_exception_never_aborts_the_copy(env, monkeypatch):
+    # _tick runs inside write_stream's teardown-on-exception scope; a raising
+    # observer must NOT unlink the .part or abort the transfer. Only the guarded
+    # intra-file emits raise here (files_done == 0, current_path set) — the
+    # unguarded completion/listing/done sites are left alone so the pass survives.
+    monkeypatch.setattr(syncrun, "_PROGRESS_COALESCE_BYTES", 2 * 1024 * 1024)
+    archive, manifest = env
+    d = FakeDevice(capacity=10_000_000_000)
+    d.put("A_sub/Light_a_20250101-000000.fit", b"a" * (5 * 1024 * 1024), mtime=1.0)
+
+    def boom(event):
+        if event.current_path is not None and event.files_done == 0:
+            raise RuntimeError("observer is broken mid-file")
+
+    s = run_sync(d, archive, manifest, config(), now=1_000_000.0, observer=boom)
+    assert s.result == "ok"
+    assert s.files_copied == 1
+    assert archive.dest_path("A_sub/Light_a_20250101-000000.fit").exists()
+    assert not list((archive.root / "MyWorks" / "A_sub").glob("*.part"))
+
+
+def test_heartbeat_line_formats_and_guards_zero_size():
+    from seestar_sync.syncrun import _heartbeat_line
+
+    line = _heartbeat_line("Solar_video/big.avi", 2_100_000_000, 28_800_000_000)
+    assert "Solar_video/big.avi" in line
+    assert "2.1/28.8 GB" in line
+    assert "(7%)" in line
+    # zero-size can't occur in practice but the guard must not divide by zero
+    assert "(100%)" in _heartbeat_line("x", 0, 0)
 
 
 def test_copy_logs_start_and_completion_lines(env, caplog):
