@@ -2590,13 +2590,14 @@ git commit -m "feat: SMB DeviceClient with guest auth and free-space fallback"
 `tests/test_cli.py`:
 
 ```python
+import hashlib
 import json
 
 from seestar_sync.cli import main
 from tests.fakes import FakeDevice
 
 
-def run_cli(tmp_path, *argv, device=None, extra_env=None):
+def run_cli(tmp_path, *argv, device=None, device_factory=None, extra_env=None):
     root = tmp_path / "archive"
     root.mkdir(exist_ok=True)
     env = {
@@ -2605,11 +2606,10 @@ def run_cli(tmp_path, *argv, device=None, extra_env=None):
         "ARCHIVE_ON_ROOT_FS_OK": "true",  # tmp dirs share st_dev with / on some systems
     }
     env.update(extra_env or {})
-    return main(
-        list(argv),
-        device_factory=lambda cfg: device if device is not None else FakeDevice(),
-        env=env,
+    factory = device_factory or (
+        lambda cfg: device if device is not None else FakeDevice()
     )
+    return main(list(argv), device_factory=factory, env=env)
 
 
 def test_missing_config_is_exit_2(tmp_path):
@@ -2636,6 +2636,56 @@ def test_unreachable_device_is_exit_0(tmp_path):
             raise DeviceUnavailable("off")
 
     assert run_cli(tmp_path, "run", "--init", device=Dead()) == 0
+
+
+def test_unreachable_at_connect_is_exit_0_and_reported(tmp_path):
+    # the PRODUCTION-primary path: SmbDeviceClient connects eagerly, so a
+    # powered-off telescope raises at the device factory, not at list_files —
+    # this branch is what keeps Kuma green every night the scope is off
+    from seestar_sync.device import DeviceUnavailable
+
+    def dead_factory(cfg):
+        raise DeviceUnavailable("off")
+
+    run_cli(tmp_path, "run", "--init")  # initialize the archive first
+    assert run_cli(tmp_path, "run", device_factory=dead_factory) == 0
+    status = json.loads(
+        (tmp_path / "archive" / ".seestar-sync" / "status.json").read_text()
+    )
+    assert status["result"] == "skipped_unreachable"
+
+
+def test_status_without_any_run_yet(tmp_path, capsys):
+    assert run_cli(tmp_path, "status") == 0
+    assert "no status yet" in capsys.readouterr().out
+
+
+def test_one_run_refuses_when_sentinel_vanishes_mid_life(tmp_path):
+    # architect finding (proven data-loss chain): the mount-drop trap is a
+    # mid-life event — the daemon's per-pass check_ready must refuse before
+    # a phantom manifest can be created and reclaim armed against it
+    import pytest
+
+    from seestar_sync.archive import Archive, ArchiveError
+    from seestar_sync.cli import _one_run
+    from seestar_sync.config import Config
+
+    root = tmp_path / "archive"
+    root.mkdir()
+    cfg = Config.from_env(
+        {"SEESTAR_HOST": "h", "ARCHIVE_DIR": str(root), "ARCHIVE_ON_ROOT_FS_OK": "true"}
+    )
+    archive = Archive(root)
+    archive.init(allow_root_fs=True)
+    d = FakeDevice()
+    d.put("M 81_sub/Light_a_20250101-000000.fit", b"data", mtime=1.0)
+    assert _one_run(cfg, archive, lambda c: d) == 0
+
+    (root / ".seestar-sync" / "ARCHIVE_MARKER").unlink()  # mount "drops"
+    d.put("M 81_sub/Light_b_20250102-000000.fit", b"more", mtime=2.0)
+    with pytest.raises(ArchiveError):
+        _one_run(cfg, archive, lambda c: d)
+    assert len(d.list_files()) == 2  # nothing deleted, nothing phantom-copied
 
 
 def test_run_with_errors_is_exit_1(tmp_path):
@@ -2670,6 +2720,10 @@ def test_rebuild_manifest(tmp_path):
     with Manifest(db) as m:
         row = m.get("M 81_sub/Light_a_20250101-000000.fit")
         assert row is not None and row.size == 4
+        # a rebuild that wrote sha256="" would re-arm reclaim on unverifiable
+        # rows — pin the real recomputed checksum and restored eligibility
+        assert row.sha256 == hashlib.sha256(b"data").hexdigest()
+        assert m.verified_ok("M 81_sub/Light_a_20250101-000000.fit", 4, 1.0)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2722,6 +2776,14 @@ def _prepare(config: Config, init: bool) -> Archive:
 
 
 def _one_run(config: Config, archive: Archive, device_factory, should_stop=None) -> int:
+    # The mount-drop trap is a MID-LIFE event, not just a startup one: in
+    # daemon mode the archive volume can vanish between scheduled passes.
+    # Re-check before every pass — otherwise Manifest.__init__'s mkdir would
+    # silently rebuild a phantom archive on the container's own layer and
+    # reclaim would delete device originals against it. ArchiveError
+    # propagates to main's handler → exit 2 (crash-loud; the restart loop +
+    # Kuma silence alert the operator).
+    archive.check_ready(allow_root_fs=config.archive_on_root_fs_ok)
     from .device import DeviceUnavailable
 
     try:
@@ -2750,7 +2812,7 @@ def _cmd_daemon(config: Config, args, device_factory) -> int:
     stop = threading.Event()
 
     def _handle_signal(signum, frame):
-        log.info("received signal %d; exiting after current run", signum)
+        log.info("received signal %d; finishing current file, then exiting", signum)
         stop.set()
 
     # The container runs this as PID 1: without a handler, docker stop's
@@ -2822,13 +2884,22 @@ def main(
         description="Mirror Seestar media to a NAS over SMB and reclaim device space.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    for name, handler in (("daemon", _cmd_daemon), ("run", _cmd_run)):
-        p = sub.add_parser(name)
+    for name, handler, help_text in (
+        ("daemon", _cmd_daemon, "scheduled sync loop (container default)"),
+        ("run", _cmd_run, "one sync pass, then exit (for cron / k8s CronJob)"),
+    ):
+        p = sub.add_parser(name, help=help_text, description=help_text)
         p.add_argument("--init", action="store_true",
                        help="first run only: create archive sentinel and directories")
         p.set_defaults(handler=handler)
-    sub.add_parser("status").set_defaults(handler=_cmd_status, init=False)
-    sub.add_parser("rebuild-manifest").set_defaults(handler=_cmd_rebuild_manifest, init=False)
+    status_help = "human-readable summary of the last run"
+    sub.add_parser("status", help=status_help, description=status_help).set_defaults(
+        handler=_cmd_status, init=False
+    )
+    rebuild_help = "re-scan the archive, recompute checksums, rebuild the manifest DB"
+    sub.add_parser(
+        "rebuild-manifest", help=rebuild_help, description=rebuild_help
+    ).set_defaults(handler=_cmd_rebuild_manifest, init=False)
 
     args = parser.parse_args(argv)
     env = os.environ if env is None else env
@@ -2867,7 +2938,7 @@ seestar-sync = "seestar_sync.cli:entrypoint"
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_cli.py -v`
-Expected: 8 passed
+Expected: 12 passed
 
 - [ ] **Step 5: Run the whole suite**
 
@@ -3071,6 +3142,10 @@ SEESTAR_LIVE_TEST=1 SEESTAR_HOST=<seestar-ip> uv run pytest tests/test_smb_live.
 ```
 
 Expected: 4 passed. If `test_stat_volume_spike` fails, set `DEVICE_CAPACITY_GB=128` in the runtime env (fallback path, already implemented) and file the finding in the README. If `register_session` fails auth, try `auth_protocol="negotiate"` and record what the S30 Pro accepted.
+
+Additional manual checks while the telescope is available (oversight watch items, record results in the README or an issue):
+- **Power-cycle recovery** (architect): run the daemon, power-cycle the Seestar between two passes, confirm the next pass reconnects rather than serving a stale cached session persistently. If stale, call `smbclient.delete_session(host)` (or `reset_connection_cache()`) on `DeviceUnavailable` before the next attempt.
+- **Mid-read hang duration** (devops): pull power mid-transfer and confirm the read fails within ~30s (connection timeout) rather than dangling on TCP retransmit. Exception containment is already proven by unit tests; this validates the *duration*.
 
 ---
 

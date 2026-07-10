@@ -223,8 +223,11 @@ files verified in this or any prior run.
   next run; 3 consecutive mismatches on one file → flag in `errors[]` and
   skip, so one bad file can't wedge the pipeline.
 - **Archive volume vanishes** (Mac SMB mount drop leaves an empty dir): the
-  sentinel `ARCHIVE_MARKER` is required at startup; missing sentinel → exit 2,
-  touch nothing. First-run init is explicit via `--init`.
+  sentinel `ARCHIVE_MARKER` is required at startup **and re-checked before
+  every sync pass** — in daemon mode the mount can drop mid-life, and without
+  the per-pass check a phantom manifest would be rebuilt on the container's
+  own layer and reclaim armed against it. Missing sentinel → exit 2, touch
+  nothing. First-run init is explicit via `--init`.
 - **No volume mounted at all** (the ephemeral-filesystem trap): without this
   guard, `--init` on an unmounted `ARCHIVE_DIR` would create the sentinel,
   manifest, and "archive" on the container's own writable layer — copies
