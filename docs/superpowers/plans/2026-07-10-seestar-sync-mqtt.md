@@ -1495,6 +1495,9 @@ In `_cmd_daemon`, construct and manage the reporter around the loop:
                 log.warning("run finished with errors (exit %d); continuing", code)
             stop.wait(interval)
     finally:
+        # must run even when ArchiveError propagates out of a pass: publishes
+        # a clean retained "offline" immediately (rather than waiting on the
+        # broker to detect the drop and fire LWT) and stops paho's thread
         if mqtt is not None:
             mqtt.stop()
     return 0
