@@ -1965,6 +1965,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from .archive import Archive, VerifyError
@@ -2346,7 +2347,7 @@ class SmbDeviceClient:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_smb_client.py -v`
-Expected: 4 passed
+Expected: 5 passed
 
 - [ ] **Step 5: Commit**
 
