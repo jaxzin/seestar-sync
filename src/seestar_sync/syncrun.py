@@ -175,10 +175,6 @@ def _copy_phase(
                     notify(ProgressEvent(
                         phase="copying", files_done=files_done, files_total=files_total,
                         bytes_done=cum, bytes_total=bytes_total, current_path=_f.path))
-                    # keep "Bytes copied" climbing through a multi-GB file too, not
-                    # just per completed file: report the in-flight total via a copy
-                    # so the real summary's verified-bytes accounting stays intact
-                    report_summary(replace(summary, bytes_copied=cum))
                     # live "bytes copied so far" incl. the in-flight partial, so the
                     # HA Bytes-copied sensor climbs THROUGH a big file, not just at
                     # its completion. base == summary.bytes_copied at file start.
