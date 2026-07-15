@@ -175,6 +175,10 @@ def _copy_phase(
                     notify(ProgressEvent(
                         phase="copying", files_done=files_done, files_total=files_total,
                         bytes_done=cum, bytes_total=bytes_total, current_path=_f.path))
+                    # keep "Bytes copied" climbing through a multi-GB file too, not
+                    # just per completed file: report the in-flight total via a copy
+                    # so the real summary's verified-bytes accounting stays intact
+                    report_summary(replace(summary, bytes_copied=cum))
                     # live "bytes copied so far" incl. the in-flight partial, so the
                     # HA Bytes-copied sensor climbs THROUGH a big file, not just at
                     # its completion. base == summary.bytes_copied at file start.
@@ -299,6 +303,17 @@ def _reclaim_phase(
         for folder in sorted(emptied_sub_folders):
             if device.remove_dir_if_empty(folder):
                 log.info("removed empty folder %s", folder)
+        # Re-measure fill AFTER deletions so the reported level reflects freed
+        # space. The reading above (used by plan_reclaim) is pre-deletion; if we
+        # left it as the reported value the HA fill sensor would lag a whole
+        # reclaim. Best-effort: a failed re-measure keeps the pre-value rather
+        # than faulting a good reclaim (dry-run frees nothing, so skip it).
+        if not config.dry_run and files_done > 0:
+            try:
+                summary.device_used_percent = round(device.disk_usage().used_percent, 1)
+                report_summary(summary)
+            except (DeviceUnavailable, FreeSpaceUnavailable) as e:
+                log.debug("post-reclaim fill re-measure failed, keeping pre-value: %s", e)
     except FreeSpaceUnavailable as e:
         # NOT a routine device-off: reclaim is blinded by config/firmware.
         # Must surface as partial so Kuma goes silent and the operator is

@@ -67,12 +67,27 @@ def test_reclaim_deletes_only_verified_with_write_ahead_audit(env):
     assert s1.files_copied == 1
     assert s1.files_deleted == 1  # verified this run, then reclaimed under pressure
     assert s1.bytes_reclaimed == 800
-    assert s1.device_used_percent == 80.0  # measured before deletions
+    assert s1.device_used_percent == 0.0  # re-measured AFTER deletions (device now empty)
     assert d.list_files() == []  # gone from device
     row = manifest.get("M 81_sub/Light_a_20250101-000000.fit")
     assert row.deleted_from_device_at is not None and row.deleted_tier == 1
     # NAS copy retained
     assert archive.dest_path("M 81_sub/Light_a_20250101-000000.fit").exists()
+
+
+def test_reclaim_remeasures_fill_after_deletions(env):
+    # the reported fill must reflect freed space, not the pre-reclaim reading
+    # the planner used — otherwise the HA fill sensor lags a whole reclaim
+    archive, manifest = env
+    d = FakeDevice(capacity=1000)
+    d.put("M 81_sub/Light_a_20250101-000000.fit", b"x" * 800, mtime=1.0)  # tier-1, deletable
+    d.put("M 81/DSO_Stacked_1_M 81_10.0s_20250101_000000.jpg", b"j" * 100, mtime=1.0)  # kept
+    s = run_sync(d, archive, manifest, config(), now=1_000_000.0)
+    assert s.files_deleted == 1 and s.bytes_reclaimed == 800  # only the sub
+    # pre-deletion fill was 90% (900/1000); after deleting the 800-byte sub the
+    # retained 100-byte JPG leaves the device at 10% — that post value is reported
+    assert s.device_used_percent == 10.0
+    assert s.device_used_percent != 90.0  # not the stale pre-reclaim reading
 
 
 def test_active_folder_is_left_alone(env):
@@ -398,6 +413,25 @@ def test_on_summary_climbs_through_a_large_file(env, monkeypatch):
     assert len(partial) >= 3, f"expected intra-file summary updates, got {snaps}"
     assert snaps == sorted(snaps)  # monotonic climb
     assert snaps[-1] == size  # finalizes at the true completed total
+
+
+def test_bytes_copied_climbs_during_a_large_file(env, monkeypatch):
+    # a multi-GB file must not freeze "Bytes copied" until it completes: the
+    # in-flight total is reported mid-file (files_copied still 0), so the HA
+    # sensor climbs continuously through the file, not just per completed file
+    import seestar_sync.syncrun as sr
+
+    monkeypatch.setattr(sr, "_PROGRESS_COALESCE_BYTES", 1)  # emit on every 1 MB chunk
+    archive, manifest = env
+    d = FakeDevice(capacity=100_000_000)
+    d.put("Solar_video/big.avi", b"x" * (3 * 1024 * 1024), mtime=1.0)  # 3 chunks
+    snaps: list[tuple[int, int]] = []
+    run_sync(d, archive, manifest, config(), now=1_000_000.0,
+             on_summary=lambda s: snaps.append((s.files_copied, s.bytes_copied)))
+    mid = [(fc, bc) for fc, bc in snaps if fc == 0]  # in-flight (file not yet done)
+    assert len(mid) >= 2  # bytes_copied moved DURING the file
+    assert [bc for _, bc in mid] == sorted(bc for _, bc in mid)  # monotonic climb
+    assert snaps[-1] == (1, 3 * 1024 * 1024)  # finalizes to the completed file
 
 
 def test_heartbeat_line_formats_and_guards_zero_size():
