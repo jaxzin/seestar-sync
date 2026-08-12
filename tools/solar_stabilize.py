@@ -18,7 +18,9 @@ fixed-radius refinement), not from a brightness centroid, so the lunar
 Pipeline:
   pass 1  detect the solar-disk center in every frame
   pass 2  translate each frame (sub-pixel) so the disk sits at the median
-          center, crop off the shift margins, pipe to ffmpeg (H.264)
+          center, crop off the shift margins, pipe to ffmpeg (H.264);
+          with --stack, motion-adaptive temporal stacking + a feathered
+          luma unsharp run between warp and encode
   verify  re-detect on the output and report residual jitter
 """
 
@@ -225,6 +227,91 @@ def detect_all(path: Path, info: VideoInfo, label: str):
     return np.array(centers), hulls, np.array(quals)
 
 
+# ------------------------------------------------------- temporal stacking
+
+
+LUT_SCALE = 8  # weight-LUT index resolution: 1/8 DN per entry
+
+
+def smoothed_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """|Gaussian-smoothed signed difference|, single channel (float32).
+
+    Weights must be computed from this, never from the raw per-pixel diff:
+    weighting neighbors by similarity to the *noisy* reference retains a
+    large correlated fraction of the reference's own noise (bilateral
+    self-bias). Smoothing the signed diff cancels incoherent pixel noise
+    while spatially coherent change (the moving lunar limb, clouds) survives
+    at full strength, so the weight field is noise-blind but motion-sighted.
+    """
+    d = (a.astype(np.float32) - b.astype(np.float32)).mean(axis=2)
+    return np.abs(cv2.GaussianBlur(d, (0, 0), 2.0))
+
+
+def estimate_noise_sigma(frames: list[np.ndarray], core: tuple[int, int, int, int]) -> float:
+    """Noise scale of the smoothed diff, from consecutive frames in the disk core.
+
+    The disk interior is static once stabilized, so consecutive smoothed
+    diffs there are the residual noise floor the weights should tolerate.
+    """
+    ys, ye, xs, xe = core
+    means = []
+    for a, b in zip(frames, frames[1:]):
+        d = smoothed_diff(a[ys:ye, xs:xe], b[ys:ye, xs:xe])
+        means.append(float(np.mean(np.clip(d, None, np.percentile(d, 99)))))
+    mean_abs = float(np.median(means)) if means else 0.3
+    return max(0.1, 1.2533 * mean_abs / np.sqrt(2.0))
+
+
+def weight_lut(sigma: float, k: float = 3.0) -> np.ndarray:
+    """Keep-the-mean weight vs smoothed diff (1/LUT_SCALE DN steps).
+
+    1.0 for diffs within the noise floor (2*sigma is subtracted before the
+    Gaussian falloff, so static pixels take the full mean), rolling to 0.0
+    for coherent change (motion, clouds), which falls back to the current
+    frame.
+    """
+    v = np.arange(256, dtype=np.float32) / LUT_SCALE
+    ex = np.maximum(v - 2.0 * sigma, 0.0)
+    return np.exp(-(ex * ex) / (2.0 * (k * sigma) ** 2)).astype(np.float32)
+
+
+def disk_feather(shape_hw: tuple[int, int], cx: float, cy: float, radius: float) -> np.ndarray:
+    """1.0 on the disk, rolling off to 0.0 by radius+25px so the halo is never ringed."""
+    yy, xx = np.ogrid[:shape_hw[0], :shape_hw[1]]
+    dist = np.hypot(xx - cx, yy - cy)
+    return np.clip((radius + 25.0 - dist) / 20.0, 0.0, 1.0).astype(np.float32)
+
+
+def stack_frame(ref16: np.ndarray, neighbors16: list[np.ndarray], lut: np.ndarray) -> np.ndarray:
+    """Motion-compensated temporal average of the ROI (float32, [0,255]).
+
+    Plain (unweighted) mean of the window for maximum noise reduction with
+    zero reference bias, then a single blend-back: wherever the mean
+    *coherently* differs from the current frame — the band the lunar limb
+    swept during the window, or cloud flicker — the output falls back to
+    the current frame, preserving full temporal resolution where the scene
+    actually changes. Per-neighbor similarity weighting is deliberately
+    avoided: weights derived from comparisons against a noisy reference
+    retain a large correlated fraction of that reference's noise
+    (bilateral self-bias).
+    """
+    acc = ref16.astype(np.float32)
+    for nb in neighbors16:
+        acc += nb
+    mean = acc / (len(neighbors16) + 1)
+    idx = np.clip(smoothed_diff(mean, ref16) * LUT_SCALE, 0, 255).astype(np.uint8)
+    keep = lut[idx][..., None]  # 1 = static: take the mean; 0 = motion: keep frame
+    return keep * mean + (1.0 - keep) * ref16.astype(np.float32)
+
+
+def sharpen_luma(bgr: np.ndarray, amount: float, mask: np.ndarray) -> np.ndarray:
+    """Luma-only unsharp mask, feathered by `mask` (float32 BGR in [0,255])."""
+    ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    y = ycc[..., 0]
+    ycc[..., 0] = y + amount * (y - cv2.GaussianBlur(y, (0, 0), 2.0)) * mask
+    return cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
+
+
 # ------------------------------------------------------------------- main
 
 
@@ -267,6 +354,13 @@ def main() -> int:
     ap.add_argument("-o", "--output", type=Path, default=None,
                     help="stabilized video (default: <input>-stabilized.mp4)")
     ap.add_argument("--crf", type=int, default=16, help="x264 quality (default 16)")
+    ap.add_argument("--stack", nargs="?", const=21, type=int, default=0, metavar="N",
+                    help="motion-adaptive temporal stacking window in frames (odd; "
+                         "bare flag = 21): averages static disk detail, keeps the "
+                         "moving lunar limb crisp")
+    ap.add_argument("--sharpen", type=float, default=0.6, metavar="AMT",
+                    help="unsharp amount for the stacked disk (0 disables; "
+                         "default 0.6; only active with --stack)")
     ap.add_argument("--compare", type=Path, default=None,
                     help="also write a side-by-side original/stabilized crop video")
     ap.add_argument("--report", type=Path, default=None,
@@ -310,15 +404,66 @@ def main() -> int:
     print(f"shift range: x [{dx.min():+.1f},{dx.max():+.1f}]  y [{dy.min():+.1f},{dy.max():+.1f}] px", flush=True)
     print(f"output: {w}x{h} (cropped from {info.width}x{info.height})", flush=True)
 
-    # -- pass 2: warp + encode ---------------------------------------------
+    # -- pass 2: warp (+ optional stack/sharpen) + encode ------------------
+    stack_win = 0
+    if args.stack:
+        stack_win = args.stack | 1  # force odd
+        if stack_win < 3:
+            print("error: --stack window must be >= 3", file=sys.stderr)
+            return 1
+    half = stack_win // 2
+    cx_o, cy_o = tx - x0, ty - y0
+    margin = int(2.2 * r_med)  # ROI covers disk + full halo; sky outside is flat black
+    rys, rye = max(0, int(cy_o) - margin), min(h, int(cy_o) + margin)
+    rxs, rxe = max(0, int(cx_o) - margin), min(w, int(cx_o) + margin)
+    if stack_win:
+        print(f"stacking: window {stack_win} frames, ROI {rxe - rxs}x{rye - rys}, "
+              f"sharpen {args.sharpen:g}", flush=True)
+        feather = disk_feather((rye - rys, rxe - rxs), cx_o - rxs, cy_o - rys, r_med)
+        core = (int(cy_o - 0.6 * r_med) - rys, int(cy_o + 0.6 * r_med) - rys,
+                int(cx_o - 0.6 * r_med) - rxs, int(cx_o + 0.6 * r_med) - rxs)
+
     enc = open_encoder(out, w, h, info.fps, args.crf)
+    buf: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
+    lut = None
+    n_seen = 0
+
+    def emit(j: int) -> None:
+        nonlocal lut
+        frame, ref16 = buf[j]
+        if stack_win:
+            if lut is None:
+                cands = [buf[k][1] for k in sorted(buf) if k < n and valid[k]][:12]
+                sigma = estimate_noise_sigma(cands, core)
+                lut = weight_lut(sigma)
+                print(f"  [stack] smoothed-diff noise sigma ~{sigma:.2f} DN", flush=True)
+            neighbors = [buf[k][1] for k in range(j - half, j + half + 1)
+                         if k != j and k in buf and k < n and valid[k]]
+            if j < n and valid[j] and neighbors:
+                stacked = stack_frame(ref16, neighbors, lut)
+                if args.sharpen > 0:
+                    stacked = sharpen_luma(stacked, args.sharpen, feather)
+                frame = frame.copy()
+                frame[rys:rye, rxs:rxe] = np.clip(np.rint(stacked), 0, 255).astype(np.uint8)
+        enc.stdin.write(frame.tobytes())
+        buf.pop(j - half, None)
+        if j % 100 == 0:
+            print(f"  [encode] frame {j}/{n}", flush=True)
+
     for i, frame in enumerate(iter_frames(inp, info)):
+        if i >= n:
+            break
         m = np.float32([[1, 0, dx[i]], [0, 1, dy[i]]])
         warped = cv2.warpAffine(frame, m, (info.width, info.height),
                                 flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
-        enc.stdin.write(warped[y0:y0 + h, x0:x0 + w].tobytes())
-        if i % 100 == 0:
-            print(f"  [encode] frame {i}/{n}", flush=True)
+        cropped = warped[y0:y0 + h, x0:x0 + w].copy()
+        buf[i] = (cropped,
+                  cropped[rys:rye, rxs:rxe].astype(np.int16) if stack_win else None)
+        n_seen += 1
+        if i - half >= 0:
+            emit(i - half)
+    for j in range(max(0, n_seen - half), n_seen):  # tail: truncated windows
+        emit(j)
     enc.stdin.close()
     if enc.wait() != 0:
         print("error: ffmpeg encode failed", file=sys.stderr)

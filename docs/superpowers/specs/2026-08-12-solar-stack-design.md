@@ -28,13 +28,24 @@ original decode.
    window truncates at clip edges. Gate-rejected frames (clouds) are excluded from
    every window but still produce output (they stack toward themselves — passthrough).
 
-2. **Motion-adaptive weights.** Per pixel, each window frame is weighted
-   `w = exp(−d² / 2(kσ)²)` where `d` is its mean-abs-channel difference from the
-   *current* frame and σ is auto-estimated frame-to-frame noise (MAD of consecutive
-   warped-frame diffs in the disk core, ÷√2). Static grain (d ≈ σ) averages away;
-   the moving lunar limb (d ≫ σ) collapses to the current frame — the bite stays
-   crisp with full temporal resolution. Thin-cloud flicker degrades gracefully the
-   same way. Implemented as a 256-entry LUT; k = 2.5.
+2. **Mean + motion blend-back.** Each output frame is the plain (unweighted) mean
+   of its window — maximum noise reduction, zero reference bias — blended back
+   toward the current frame wherever the mean *coherently* differs from it: the
+   band the lunar limb swept during the window, cloud flicker, or strong
+   atmospheric drift. The blend factor is `1 − exp(−max(d−2σ, 0)² / 2(kσ)²)`
+   (256-entry LUT, k = 3), where `d` is the |Gaussian-smoothed (σ=2px) signed
+   diff| of mean vs current frame and σ is auto-estimated from consecutive
+   smoothed diffs in the disk core. Two lessons are baked in, learned the hard
+   way during implementation:
+   - *No per-neighbor similarity weighting.* Weighting neighbors by their
+     difference from the noisy current frame retains a large correlated fraction
+     of that frame's own noise (bilateral self-bias; measured ~60% retention).
+   - *Smooth the diff before thresholding.* Raw per-pixel diffs make the weight
+     field itself noisy; spatial smoothing cancels incoherent noise while
+     coherent change survives, so motion is detected at high significance.
+   Note the video carries real low-frequency evolution (~4 DN per 10 frames of
+   atmospheric shimmer); the blend deliberately preserves it — flattening it
+   would freeze the timelapse's living texture.
 
 3. **Region of interest.** Stacking applies inside a static box (~2.2 R) around the
    locked disk center; outside is passthrough (sky is measured flat zero). Keeps the

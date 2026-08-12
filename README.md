@@ -323,6 +323,13 @@ uv run tools/solar_stabilize.py "Solar-timelapse.mov" --report jitter.png --comp
 Output defaults to `<input>-stabilized.mp4` beside the input. `--report` writes a
 before/after center-track plot; `--compare` writes a side-by-side crop video.
 
+`--stack [N]` (bare flag = 21-frame window) additionally enhances detail with
+motion-adaptive temporal stacking: each frame becomes a weighted average of its
+aligned neighbors, erasing sensor grain on the static solar disk while pixels near
+the moving lunar limb keep full temporal resolution — the eclipse "bite" stays
+crisp. A gentle luma-only unsharp (`--sharpen`, default 0.6) then lifts sunspot
+and limb detail.
+
 ## Design spec
 
 For the full design rationale (SMB client choice, manifest schema, safety properties,
