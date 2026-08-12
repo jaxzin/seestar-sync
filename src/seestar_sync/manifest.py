@@ -44,6 +44,21 @@ class Manifest:
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path)
+        # The archive is a network share. SQLite's default DELETE journal mode
+        # UNLINKS the rollback journal at commit, and delete-while-open is exactly
+        # the operation an SMB mount performs unreliably (the same defect that
+        # litters .seestar-sync/ with .smbdelete* tombstones). A failed unlink
+        # strands a hot journal; the next open must roll it back, cannot, and
+        # raises "disk I/O error" — which crash-looped the daemon for ~4h on
+        # 2026-08-12 until the journal was applied by hand off the share.
+        #
+        # TRUNCATE zeroes the journal instead of unlinking it, so the unreliable
+        # operation is never attempted. Set BEFORE executescript: that first write
+        # is what the crash-loop died on.
+        #
+        # NOT WAL: it requires shared memory, which network filesystems do not
+        # provide. Do not "upgrade" this.
+        self._conn.execute("PRAGMA journal_mode=TRUNCATE")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
