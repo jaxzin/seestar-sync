@@ -307,6 +307,22 @@ Treat broker compromise as equivalent to compromising this tool directly.
 `MQTT_PASSWORD` is a secret like the Kuma push URL: it belongs in `.env` only, is never
 written to `status.json`/history, and is redacted from log output even in error paths.
 
+## Tools
+
+`tools/solar_stabilize.py` stabilizes a Seestar solar timelapse by locking the solar
+disk to a fixed position (removes mount jitter and drift). Eclipse-safe — it fits a
+circle to the solar limb rather than tracking the brightness centroid, so the lunar
+bite doesn't pull the track off center — and cloud-robust: frames whose limb fit
+fails quality gates are interpolated through. Requires `ffmpeg` on PATH; Python
+dependencies resolve automatically via `uv`.
+
+```bash
+uv run tools/solar_stabilize.py "Solar-timelapse.mov" --report jitter.png --compare compare.mp4
+```
+
+Output defaults to `<input>-stabilized.mp4` beside the input. `--report` writes a
+before/after center-track plot; `--compare` writes a side-by-side crop video.
+
 ## Design spec
 
 For the full design rationale (SMB client choice, manifest schema, safety properties,
