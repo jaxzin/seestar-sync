@@ -230,7 +230,6 @@ def detect_all(path: Path, info: VideoInfo, label: str):
 # ------------------------------------------------------- temporal stacking
 
 
-LUT_SCALE = 8  # weight-LUT index resolution: 1/8 DN per entry
 
 
 def smoothed_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -262,17 +261,24 @@ def estimate_noise_sigma(frames: list[np.ndarray], core: tuple[int, int, int, in
     return max(0.1, 1.2533 * mean_abs / np.sqrt(2.0))
 
 
-def weight_lut(sigma: float, k: float = 3.0) -> np.ndarray:
-    """Keep-the-mean weight vs smoothed diff (1/LUT_SCALE DN steps).
+def weight_lut(sigma: float, k: float = 3.0) -> tuple[np.ndarray, float]:
+    """Keep-the-mean weight vs smoothed diff. Returns (lut, index scale).
 
     1.0 for diffs within the noise floor (2*sigma is subtracted before the
     Gaussian falloff, so static pixels take the full mean), rolling to 0.0
     for coherent change (motion, clouds), which falls back to the current
-    frame.
+    frame. The 256-entry domain is sized to sigma (floor + 4k*sigma of
+    falloff) and the last entry is forced to exactly 0, so any diff beyond
+    the domain — however noisy the source — keeps the current frame
+    outright rather than ghosting in a fraction of the mean.
     """
-    v = np.arange(256, dtype=np.float32) / LUT_SCALE
+    span = (2.0 + 4.0 * k) * sigma
+    scale = 255.0 / span
+    v = np.arange(256, dtype=np.float32) / scale
     ex = np.maximum(v - 2.0 * sigma, 0.0)
-    return np.exp(-(ex * ex) / (2.0 * (k * sigma) ** 2)).astype(np.float32)
+    lut = np.exp(-(ex * ex) / (2.0 * (k * sigma) ** 2)).astype(np.float32)
+    lut[-1] = 0.0
+    return lut, scale
 
 
 def disk_feather(shape_hw: tuple[int, int], cx: float, cy: float, radius: float) -> np.ndarray:
@@ -282,7 +288,8 @@ def disk_feather(shape_hw: tuple[int, int], cx: float, cy: float, radius: float)
     return np.clip((radius + 25.0 - dist) / 20.0, 0.0, 1.0).astype(np.float32)
 
 
-def stack_frame(ref16: np.ndarray, neighbors16: list[np.ndarray], lut: np.ndarray) -> np.ndarray:
+def stack_frame(ref16: np.ndarray, neighbors16: list[np.ndarray],
+                lut: np.ndarray, lut_scale: float) -> np.ndarray:
     """Motion-compensated temporal average of the ROI (float32, [0,255]).
 
     Plain (unweighted) mean of the window for maximum noise reduction with
@@ -299,7 +306,7 @@ def stack_frame(ref16: np.ndarray, neighbors16: list[np.ndarray], lut: np.ndarra
     for nb in neighbors16:
         acc += nb
     mean = acc / (len(neighbors16) + 1)
-    idx = np.clip(smoothed_diff(mean, ref16) * LUT_SCALE, 0, 255).astype(np.uint8)
+    idx = np.clip(smoothed_diff(mean, ref16) * lut_scale, 0, 255).astype(np.uint8)
     keep = lut[idx][..., None]  # 1 = static: take the mean; 0 = motion: keep frame
     return keep * mean + (1.0 - keep) * ref16.astype(np.float32)
 
@@ -367,6 +374,13 @@ def main() -> int:
                     help="write a PNG plot of the center track before/after")
     args = ap.parse_args()
 
+    stack_win = 0
+    if args.stack:
+        stack_win = args.stack | 1  # force odd
+        if stack_win < 3:
+            print("error: --stack window must be >= 3", file=sys.stderr)
+            return 1
+
     inp: Path = args.input
     out: Path = args.output or inp.with_name(inp.stem + "-stabilized.mp4")
     info = probe(inp)
@@ -405,12 +419,6 @@ def main() -> int:
     print(f"output: {w}x{h} (cropped from {info.width}x{info.height})", flush=True)
 
     # -- pass 2: warp (+ optional stack/sharpen) + encode ------------------
-    stack_win = 0
-    if args.stack:
-        stack_win = args.stack | 1  # force odd
-        if stack_win < 3:
-            print("error: --stack window must be >= 3", file=sys.stderr)
-            return 1
     half = stack_win // 2
     cx_o, cy_o = tx - x0, ty - y0
     margin = int(2.2 * r_med)  # ROI covers disk + full halo; sky outside is flat black
@@ -420,27 +428,35 @@ def main() -> int:
         print(f"stacking: window {stack_win} frames, ROI {rxe - rxs}x{rye - rys}, "
               f"sharpen {args.sharpen:g}", flush=True)
         feather = disk_feather((rye - rys, rxe - rxs), cx_o - rxs, cy_o - rys, r_med)
-        core = (int(cy_o - 0.6 * r_med) - rys, int(cy_o + 0.6 * r_med) - rys,
-                int(cx_o - 0.6 * r_med) - rxs, int(cx_o + 0.6 * r_med) - rxs)
+        # Clamped to the ROI: with the disk near a frame edge the naive
+        # rectangle goes negative and Python wraparound yields empty slices.
+        core = (max(0, int(cy_o - 0.6 * r_med) - rys), min(rye - rys, int(cy_o + 0.6 * r_med) - rys),
+                max(0, int(cx_o - 0.6 * r_med) - rxs), min(rxe - rxs, int(cx_o + 0.6 * r_med) - rxs))
 
     enc = open_encoder(out, w, h, info.fps, args.crf)
     buf: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
-    lut = None
+    lut, lut_scale = None, 1.0
     n_seen = 0
 
     def emit(j: int) -> None:
-        nonlocal lut
+        nonlocal lut, lut_scale
         frame, ref16 = buf[j]
         if stack_win:
             if lut is None:
+                # Deferred until >= 2 valid frames are buffered: a clip that
+                # opens under cloud must not freeze the LUT on the fallback
+                # sigma and mistune stacking for the whole video. Frames
+                # emitted before init pass through unstacked (they are the
+                # cloudy ones anyway).
                 cands = [buf[k][1] for k in sorted(buf) if k < n and valid[k]][:12]
-                sigma = estimate_noise_sigma(cands, core)
-                lut = weight_lut(sigma)
-                print(f"  [stack] smoothed-diff noise sigma ~{sigma:.2f} DN", flush=True)
+                if len(cands) >= 2:
+                    sigma = estimate_noise_sigma(cands, core)
+                    lut, lut_scale = weight_lut(sigma)
+                    print(f"  [stack] smoothed-diff noise sigma ~{sigma:.2f} DN", flush=True)
             neighbors = [buf[k][1] for k in range(j - half, j + half + 1)
                          if k != j and k in buf and k < n and valid[k]]
-            if j < n and valid[j] and neighbors:
-                stacked = stack_frame(ref16, neighbors, lut)
+            if lut is not None and j < n and valid[j] and neighbors:
+                stacked = stack_frame(ref16, neighbors, lut, lut_scale)
                 if args.sharpen > 0:
                     stacked = sharpen_luma(stacked, args.sharpen, feather)
                 frame = frame.copy()
