@@ -81,6 +81,39 @@ required a repo transfer on 2026-07-17.
 **Accepted cost:** the clone URL changes; the local remote and every reference
 must be updated in the same change.
 
+### D4 — Generalize `roles/nfs_share` to loop over exported shares
+
+Discovered during planning, after D1 was approved. `nas.yml`'s two share-managing
+roles partition the list by the presence of `nfs_exports`:
+
+- `ansible/roles/dsm_shares/tasks/main.yml:4-17` selects with
+  `rejectattr('nfs_exports', 'defined')` — adding the key **removes `astrograph`
+  from `dsm_shares`**.
+- `ansible/roles/nfs_share/defaults/main.yml` hardcodes
+  `nfs_share_lookup: "netboot"` — a single share name, not a list.
+
+So D1's change as originally specified would have left `astrograph` managed by
+**neither** role. The partition invariant that `nas.yml:143-152` asserts is only
+half-implemented.
+
+**Chosen:** replace the hardcoded lookup with a loop over every share carrying an
+`nfs_exports` key, moving the role body into a looped `converge_share.yml`. This
+makes the claimed invariant real and keeps the data driving the behavior.
+
+**Accepted cost:** this refactors a safety-critical role. Its read-back verify
+asserts the live export list *exactly* equals the desired one — deliberately, so
+that a partially-applied save cannot converge green with the boot base writable
+by the whole LAN. The `netboot` export is the Pi fleet's NFS root, so the fleet's
+boot path is in the blast radius. The plan must prove `netboot`'s export is
+byte-identical before and after the refactor, in validate mode, before any
+`astrograph` export is added.
+
+**Also settled by this investigation:** the squash value needed for uid 1026 is
+`root_squash: "root"` — DSM's "No-mapping", already proven on both `netboot`
+rules. The spec's earlier "no user squashing" prose resolves to that literal. Note
+that `''` is the projection default and nothing supplies a safe fallback, so the
+key must be declared explicitly on every rule.
+
 ### D3 — Cutover: shadow in dry-run, then hard cutover
 
 The pod is deployed first with `DRY_RUN=true` and a distinct MQTT topic prefix,
@@ -96,7 +129,7 @@ Four repos, split by the fleet boundaries. No repo takes on a neighbor's layer.
 
 | Repo | Change | Ownership rationale |
 |---|---|---|
-| `fallen-leaf/nas-setup` | `nfs_exports` on the `astrograph` share | host layer — the NAS owns its exports |
+| `fallen-leaf/nas-setup` | generalize `roles/nfs_share` to loop (D4); `nfs_exports` on the `astrograph` share | host layer — the NAS owns its exports |
 | `fallen-leaf/seestar-sync` | `.gitea/workflows/build-images.yml` | the app owns how it is built |
 | `fallen-leaf/homelab-cluster` | `platform/seestar-sync{-ns,.app}.yaml` + `platform/seestar-sync/` | the cluster owns *how a service runs* |
 | `fallen-leaf/uptime-kuma` | one entry in `deploy/monitors.yaml` | the service repo owns *what it watches* — stated verbatim in `apps/uptime-kuma-converge.yaml` |
@@ -108,17 +141,33 @@ Export declaration in `nas-setup/nas.yml`:
 ```yaml
 - name: astrograph
   volume: /volume1
+  purpose: "Seestar astrophotography FITS captures — irreplaceable"
+  desc: "Seestar astrophotography FITS - salvaged 2026-07-26"
   nfs_exports:
-    - client: 192.168.10.0/24
-      privilege: rw
-      # No user squashing: the pod must present uid 1026 so files land as
-      # jaxzin:users, matching what the SMB mount produced.
+    - client: "192.168.10.0/24"
+      privilege: "rw"
+      # "root" = DSM No-mapping. Required: the pod presents uid 1026 so files
+      # land as jaxzin:users, matching what the SMB mount produced.
+      root_squash: "root"
+      async: true
+      insecure: true
+      crossmnt: false
+      security_flavor: {sys: true, kerberos: false, kerberos_integrity: false, kerberos_privacy: false}
 ```
 
-The shape above is illustrative. The implementation plan must first read the
-existing `netboot` export in `nas-setup/nas.yml:98-142` — the only current
-`nfs_exports` user — and match `roles/nfs_share`'s actual schema, including
-whatever key that role uses for squash mapping. Do not invent key names.
+Schema confirmed against `ansible/roles/nfs_share/tasks/main.yml:250-261` (the
+7-key projection) and the working `netboot` rules at `nas.yml:114-127`. Every key
+is passed to the DSM API verbatim, so the YAML keys *are* the DSM field names.
+`crossmnt` is `false` here because — unlike `netboot`, whose nfsroot is a
+subfolder — nothing mounts across a nested mountpoint in this share.
+
+`desc` must stay ≤64 characters; DSM rejects longer with a bare error 3300, and
+the role asserts the limit before create.
+
+Whether `astrograph` also needs a `share_permissions` block (as `netboot` does,
+because a DSM share ACL default-DENY overrides the 777 POSIX mode) is a Phase 0
+verification item, not an assumption: the share is already reachable over SMB as
+`jaxzin`, so a grant may already exist.
 
 Cluster binding, in `platform/seestar-sync/seestar-sync.yaml`:
 
@@ -232,7 +281,8 @@ in code.
 
 | Phase | Action | Gate before proceeding |
 |---|---|---|
-| 0 | NFS export lands | `mount -t nfs` from `nuc` succeeds; write **and delete** a probe file as uid 1026; confirm it lands `jaxzin:users` |
+| 0a | Generalize `roles/nfs_share` (D4), no data change | validate-mode run shows `netboot`'s effective export list byte-identical to before the refactor; a second run reports `changed=0` |
+| 0b | NFS export lands on `astrograph` | `mount -t nfs` from `nuc` succeeds; write **and delete** a probe file as uid 1026; confirm it lands `jaxzin:users` |
 | 1 | Repo transfer; kaniko workflow | build green on the NAS runner; image pullable by SHA tag |
 | 2 | Deploy shadow: `DRY_RUN=true`, `MQTT_TOPIC_PREFIX=seestar-sync-k8s`, `KUMA_PUSH_URL` unset | pod Ready; file count matches the Mac's; planned bytes match; **zero writes to the archive** |
 | 3 | `docker compose down` on the Mac, **then** promote the pod to the production prefix + Kuma URL | Mac `seestar-sync/availability` confirmed `offline` *before* the pod arms |
@@ -259,7 +309,14 @@ prefix on 2026-07-15.
 3. **Re-copy storm.** If mtimes as seen over NFS differ from what the SMB mount
    reported, the manifest may judge files uncopied and re-copy ~86 GB.
    *Detector:* the Phase 2 dry-run count comparison against the Mac.
-4. **Single-node NFS dependency.** If the NAS is down when the pod starts, the
+4. **Regressing the Pi fleet's boot mount.** The D4 refactor rewrites the code
+   path that converges `netboot`'s export — the NFS root every netbooted Pi
+   pages at boot. A mistake here does not break seestar-sync; it breaks the
+   fleet. *Detector:* the Phase 0a byte-identical comparison, in validate mode,
+   before any data change. Note the role has no captured run-twice `changed=0`
+   evidence today (`docs/migration-from-homelab-netboot.md:119` explicitly
+   defers it), so Phase 0a establishes that baseline for the first time.
+5. **Single-node NFS dependency.** If the NAS is down when the pod starts, the
    mount fails and the pod will not become Ready. This is not a regression — the
    Mac deployment had the same dependency via the SMB mount, and the sentinel
    guard exits rather than writing into ephemeral storage.
