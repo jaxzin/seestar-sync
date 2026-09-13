@@ -1,0 +1,42 @@
+name: CI
+
+# Runs the unit suite on every PR and on main. The live tests (real telescope,
+# real MQTT broker) self-skip via pytest.mark.skipif unless SEESTAR_LIVE_TEST /
+# MQTT_LIVE_TEST are set — this runner never sets them, so no marker filter is
+# needed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest + ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install uv via the official shell installer instead of astral-sh/setup-uv,
+      # which requires node24 — a runtime the self-hosted runner does not support.
+      # Same constraint documented in obsidian-mcp's scan.yml.
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # dev tools (pytest, ruff) live in [dependency-groups].dev, which uv syncs
+      # by default. --frozen fails the job if uv.lock is stale.
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check src/ tests/
+
+      - name: Test
+        run: uv run pytest -q

@@ -68,7 +68,7 @@ class Config:
     log_level: str
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> "Config":
+    def from_env(cls, env: Mapping[str, str]) -> Config:
         host = env.get("SEESTAR_HOST", "").strip()
         if not host:
             raise ConfigError(

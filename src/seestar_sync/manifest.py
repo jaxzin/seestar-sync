@@ -9,6 +9,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Self
 
 MTIME_TOLERANCE = 2.0  # seconds; FAT-ish filesystems have coarse timestamps
 
@@ -76,7 +77,7 @@ class Manifest:
     def close(self) -> None:
         self._conn.close()
 
-    def __enter__(self) -> "Manifest":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc) -> None:

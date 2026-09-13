@@ -259,7 +259,7 @@ def test_one_run_wires_mqtt_observer_and_summary(tmp_path):
     assert mqtt.events[0].phase == "listing"
     assert mqtt.events[-1].phase == "done"
     assert len(mqtt.summaries) == 1
-    summary, effective, sources = mqtt.summaries[0]
+    summary, _effective, sources = mqtt.summaries[0]
     assert summary.result == "ok"
     assert set(sources) == {"dry_run", "reclaim_enabled", "seestar_host"}
     # interim summary fired live during the pass (one 4-byte file completed)
