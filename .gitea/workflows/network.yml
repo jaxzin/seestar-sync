@@ -102,7 +102,7 @@ jobs:
             echo "::error::BOOTSTRAP GATE: cannot log in to OpenBao as cip-seestar-sync."
             echo "SEESTAR_SYNC_APPROLE_ROLE_ID/_SECRET_ID are not hand-minted — openbao-infra's"
             echo "CI provisioner mints them AND writes them into this repo's Actions secrets."
-            echo "Fix: merge the fallen-leaf/openbao-infra PR adding the cip-seestar-sync consumer entry"
+            echo "Fix: merge fallen-leaf/openbao-infra#433 (the cip-seestar-sync consumer entry"
             echo "plus the three infra/ grants; it needs a maintainer 👍 on the reaction gate),"
             echo "let the provisioner run, then re-run this job. Nothing to paste by hand."
             # Safe to echo: this branch runs only when no token was returned, so
@@ -200,7 +200,7 @@ jobs:
             echo "::error::BOOTSTRAP GATE: cannot log in to OpenBao as cip-seestar-sync."
             echo "SEESTAR_SYNC_APPROLE_ROLE_ID/_SECRET_ID are not hand-minted — openbao-infra's"
             echo "CI provisioner mints them AND writes them into this repo's Actions secrets."
-            echo "Fix: merge the fallen-leaf/openbao-infra PR adding the cip-seestar-sync consumer entry"
+            echo "Fix: merge fallen-leaf/openbao-infra#433 (the cip-seestar-sync consumer entry"
             echo "plus the three infra/ grants; it needs a maintainer 👍 on the reaction gate),"
             echo "let the provisioner run, then re-run this job. Nothing to paste by hand."
             # Safe to echo: this branch runs only when no token was returned, so
