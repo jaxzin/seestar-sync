@@ -58,7 +58,18 @@ class Manifest:
         #
         # NOT WAL: it requires shared memory, which network filesystems do not
         # provide. Do not "upgrade" this.
-        self._conn.execute("PRAGMA journal_mode=TRUNCATE")
+        #
+        # PER-CONNECTION ONLY: non-WAL journal modes are not persisted in the file,
+        # so any OTHER sqlite3.connect() on manifest.db silently reverts to DELETE.
+        # All access must go through this class. The PRAGMA returns the mode that
+        # took effect, and SQLite may refuse a change silently — so check it.
+        mode = self._conn.execute("PRAGMA journal_mode=TRUNCATE").fetchone()[0]
+        if mode.lower() != "truncate":
+            self._conn.close()
+            raise RuntimeError(
+                f"manifest.db journal_mode is {mode!r}, not 'truncate'; refusing to "
+                "run on a network share where DELETE mode strands hot journals"
+            )
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 

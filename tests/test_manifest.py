@@ -35,8 +35,31 @@ def test_commit_leaves_no_journal_to_unlink(tmp_path):
     with Manifest(db) as m:
         m.record_verified("M 81_sub/a.fit", 100, 1000.0, "abc123", "2026-07-09T00:00:00Z")
     journal = tmp_path / "manifest.db-journal"
-    if journal.exists():
-        assert journal.stat().st_size == 0, "journal left with content — it is hot"
+    # Must EXIST: under DELETE mode the file is unlinked and absent, so an
+    # existence-guarded check would pass with the fix reverted.
+    assert journal.exists(), "journal absent — it was unlinked (DELETE mode)"
+    assert journal.stat().st_size == 0, "journal left with content — it is hot"
+
+
+def test_manifest_is_the_only_sqlite_connection():
+    """journal_mode=TRUNCATE is per-connection, not stored in the file.
+
+    A second sqlite3.connect() anywhere in the package would open manifest.db in
+    DELETE mode and reintroduce the stranded-hot-journal crash-loop, silently.
+    """
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "seestar_sync"
+    offenders = [
+        f"{p.name}:{n}"
+        for p in src.rglob("*.py")
+        for n, line in enumerate(p.read_text().splitlines(), 1)
+        if "sqlite3.connect(" in line and not line.lstrip().startswith("#")
+    ]
+    assert offenders == ["manifest.py:46"], (
+        f"direct sqlite3.connect outside Manifest.__init__: {offenders} — route "
+        "all access through Manifest so journal_mode=TRUNCATE is applied"
+    )
 
 
 def test_record_and_verify(tmp_path):
