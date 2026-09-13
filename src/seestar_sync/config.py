@@ -66,6 +66,10 @@ class Config:
     dry_run: bool
     archive_on_root_fs_ok: bool
     log_level: str
+    # SHADOW_MODE: read-only observer of an archive another instance owns.
+    # Forces a hard dry run with reclaim off, ignores settings.json/MQTT
+    # overrides, opens the manifest read-only and writes nothing to the archive.
+    shadow_mode: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Config:
@@ -125,6 +129,7 @@ class Config:
                 "surface can enable deletion, so broker credentials are "
                 "required (Mosquitto add-on: create a dedicated user)"
             )
+        shadow = _bool(env, "SHADOW_MODE")
         mqtt_topic_prefix = env.get("MQTT_TOPIC_PREFIX", "seestar-sync").strip()
         if not mqtt_topic_prefix or any(c in mqtt_topic_prefix for c in "/#+"):
             raise ConfigError(
@@ -137,7 +142,7 @@ class Config:
             archive_dir=Path(env.get("ARCHIVE_DIR", "/archive")),
             sync_interval_minutes=interval,
             # deletion is opt-in (user-ratified): default false = copy-only
-            reclaim_enabled=_bool(env, "RECLAIM_ENABLED"),
+            reclaim_enabled=not shadow and _bool(env, "RECLAIM_ENABLED"),
             reclaim_trigger_percent=trigger,
             reclaim_target_percent=target,
             active_window_minutes=window,
@@ -149,7 +154,10 @@ class Config:
             mqtt_username=mqtt_username,
             mqtt_password=mqtt_password,
             mqtt_topic_prefix=mqtt_topic_prefix,
-            dry_run=_bool(env, "DRY_RUN"),
+            # SHADOW_MODE wins over DRY_RUN/RECLAIM_ENABLED: it is a hard
+            # guarantee, not a default, so nothing downstream may re-arm it
+            dry_run=shadow or _bool(env, "DRY_RUN"),
             archive_on_root_fs_ok=_bool(env, "ARCHIVE_ON_ROOT_FS_OK"),
             log_level=log_level,
+            shadow_mode=shadow,
         )

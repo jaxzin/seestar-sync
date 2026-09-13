@@ -94,3 +94,16 @@ def test_ha_webhook_reporter_is_gone():
     from seestar_sync import reporters
 
     assert not hasattr(reporters, "post_ha_webhook")
+
+
+def test_shadow_mode_reports_kuma_but_writes_nothing(tmp_path, monkeypatch):
+    from seestar_sync import reporters
+
+    pings = []
+    monkeypatch.setattr(reporters, "ping_kuma", lambda url, s: pings.append(url))
+    cfg = Config.from_env({"SEESTAR_HOST": "h", "SHADOW_MODE": "true",
+                           "KUMA_PUSH_URL": "https://kuma.example/api/push/x"})
+    meta = tmp_path / "meta"
+    report_all(cfg, meta, summary())
+    assert pings == ["https://kuma.example/api/push/x"]
+    assert not meta.exists()

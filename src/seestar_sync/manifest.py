@@ -42,9 +42,24 @@ class ManifestRow:
 
 
 class Manifest:
-    def __init__(self, db_path: Path):
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
+    def __init__(self, db_path: Path, read_only: bool = False):
+        if read_only:
+            # SHADOW_MODE: another instance owns this file. mode=ro guarantees
+            # SQLite never writes it (no journal, no schema, no PRAGMA that
+            # persists); a missing DB is an error, never a create.
+            if not db_path.is_file():
+                raise FileNotFoundError(
+                    f"{db_path} not found; SHADOW_MODE never creates the manifest "
+                    "(point ARCHIVE_DIR at an archive another instance maintains)"
+                )
+            target, uri = f"{db_path.resolve().as_uri()}?mode=ro", True
+        else:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            target, uri = str(db_path), False
+        # the package's ONLY sqlite3.connect (see test_manifest_is_the_only_...)
+        self._conn = sqlite3.connect(target, uri=uri)
+        if read_only:
+            return
         # The archive is a network share. SQLite's default DELETE journal mode
         # UNLINKS the rollback journal at commit, and delete-while-open is exactly
         # the operation an SMB mount performs unreliably (the same defect that

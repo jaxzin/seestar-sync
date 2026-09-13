@@ -60,7 +60,9 @@ def ping_kuma(url: str, summary: RunSummary) -> None:
 
 
 def report_all(config: Config, meta_dir: Path, summary: RunSummary) -> None:
-    _guard("status", write_status, meta_dir, summary)
-    _guard("history", append_history, meta_dir, summary)
+    # shadow mode must not write the archive it observes; Kuma still pings
+    if not config.shadow_mode:
+        _guard("status", write_status, meta_dir, summary)
+        _guard("history", append_history, meta_dir, summary)
     if config.kuma_push_url:
         _guard("kuma", ping_kuma, config.kuma_push_url, summary)

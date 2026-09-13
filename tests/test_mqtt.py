@@ -317,3 +317,24 @@ def test_disabled_without_mqtt_host(tmp_path):
     rep.start()  # no-op, no client created
     rep.handle_progress(ProgressEvent(phase="copying"))
     rep.stop()  # all safe no-ops
+
+
+def test_shadow_mode_refuses_settings_commands(tmp_path, caplog):
+    rep, fake, _, _config, _store = make(tmp_path, SHADOW_MODE="true")
+    rep.start()
+    fake.published.clear()
+
+    class Msg:
+        def __init__(self, topic, payload):
+            self.topic = topic
+            self.payload = payload
+
+    with caplog.at_level("WARNING"):
+        for key, payload in (("dry_run", b"OFF"), ("reclaim_enabled", b"ON"),
+                             ("seestar_host", b"scope2.local")):
+            fake.on_message(fake, None, Msg(f"seestar-sync/set/{key}", payload))
+    assert not (tmp_path / "settings.json").exists()
+    assert "SHADOW_MODE" in caplog.text
+    # state still published (re-echo) so HA snaps back to the forced values
+    assert ("seestar-sync/settings/dry_run", "ON", True) in fake.published
+    assert ("seestar-sync/settings/reclaim_enabled", "OFF", True) in fake.published

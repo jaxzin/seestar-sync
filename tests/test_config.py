@@ -130,3 +130,17 @@ def test_mqtt_validation_is_fatal():
 
 def test_ha_webhook_url_is_gone():
     assert not hasattr(Config.from_env(base_env()), "ha_webhook_url")
+
+
+def test_shadow_mode_forces_hard_dry_run():
+    cfg = Config.from_env({"SEESTAR_HOST": "h", "SHADOW_MODE": "true",
+                           "DRY_RUN": "false", "RECLAIM_ENABLED": "true"})
+    assert cfg.shadow_mode is True
+    assert cfg.dry_run is True
+    assert cfg.reclaim_enabled is False
+
+
+def test_shadow_mode_defaults_off_and_uses_bool_parsing():
+    assert Config.from_env({"SEESTAR_HOST": "h"}).shadow_mode is False
+    with pytest.raises(ConfigError, match="SHADOW_MODE"):
+        Config.from_env({"SEESTAR_HOST": "h", "SHADOW_MODE": "maybe"})

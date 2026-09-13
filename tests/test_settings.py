@@ -64,3 +64,16 @@ def test_resolve_effective_precedence_and_sources(tmp_path):
     assert sources["reclaim_enabled"] == "env"
     # the original config is untouched (frozen + replace)
     assert base.dry_run is False
+
+
+def test_shadow_mode_ignores_settings_overrides(tmp_path):
+    store = SettingsStore(tmp_path / "settings.json")
+    store.set("dry_run", False, "t")
+    store.set("reclaim_enabled", True, "t")
+    store.set("seestar_host", "other.local", "t")
+    cfg = Config.from_env({"SEESTAR_HOST": "h", "SHADOW_MODE": "on"})
+    effective, sources = resolve_effective(cfg, store)
+    assert effective.dry_run is True
+    assert effective.reclaim_enabled is False
+    assert effective.seestar_host == "h"
+    assert set(sources.values()) == {"shadow mode"}
