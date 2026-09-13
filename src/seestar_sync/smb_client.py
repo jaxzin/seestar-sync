@@ -7,6 +7,7 @@ The RPC port (4700) is auth-locked on fw >= 7.18 and deliberately unused here.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from contextlib import contextmanager
 from typing import BinaryIO
@@ -41,10 +42,8 @@ class _MappedReader:
             return self._raw.read(n)
 
     def close(self) -> None:
-        try:
+        with contextlib.suppress(Exception):  # closing a dead handle is not an event
             self._raw.close()
-        except Exception:  # noqa: BLE001 — closing a dead handle is not an event
-            pass
 
     def __enter__(self):
         return self

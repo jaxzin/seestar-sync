@@ -81,7 +81,7 @@ def topics(fake):
 
 
 def test_start_publishes_discovery_availability_and_settings(tmp_path):
-    rep, fake, _, config, store = make(tmp_path)
+    rep, fake, *_ = make(tmp_path)
     rep.start()
     assert fake.auth == ("u", "p")
     assert fake.will == ("seestar-sync/availability", "offline", True)
@@ -174,7 +174,7 @@ def test_interim_summary_throttled_retained_and_totals_only(tmp_path):
 
 
 def test_command_round_trip_and_invalid_payloads(tmp_path):
-    rep, fake, _, config, store = make(tmp_path)
+    rep, fake, _, _config, store = make(tmp_path)
     rep.start()
     fake.published.clear()
 
@@ -199,7 +199,7 @@ def test_command_round_trip_and_invalid_payloads(tmp_path):
 
 def test_phase_change_publishes_immediately(tmp_path):
     # spec: phase changes bypass the throttle
-    rep, fake, clock, *_ = make(tmp_path)
+    rep, fake, *_ = make(tmp_path)
     rep.start()
     fake.published.clear()
     rep.handle_progress(ProgressEvent(phase="copying", files_total=2, bytes_total=20))
@@ -222,7 +222,7 @@ def test_reconnect_republishes_discovery_and_settings(tmp_path):
 
 
 def test_invalid_host_command_rejected_and_reechoed(tmp_path):
-    rep, fake, _, config, store = make(tmp_path)
+    rep, fake, _, _config, store = make(tmp_path)
     rep.start()
     fake.published.clear()
 
@@ -301,7 +301,7 @@ def test_guard_warnings_fire_and_redact_readably(tmp_path, caplog):
 
 def test_progress_percent_zero_total(tmp_path):
     # division guard: a zero-byte plan must publish 0.0, not die silently
-    rep, fake, clock, *_ = make(tmp_path)
+    rep, fake, *_ = make(tmp_path)
     rep.start()
     fake.published.clear()
     rep.handle_progress(ProgressEvent(phase="done"))

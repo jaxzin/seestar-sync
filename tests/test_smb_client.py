@@ -16,7 +16,7 @@ class _FakeDirInfo:
     def __init__(self, size: int, mtime_epoch: float):
         self.end_of_file = size
         self.last_write_time = datetime.datetime.fromtimestamp(
-            mtime_epoch, tz=datetime.timezone.utc
+            mtime_epoch, tz=datetime.UTC
         )
 
 
@@ -80,18 +80,15 @@ def test_unc_rejects_traversal():
 def test_error_mapping_wraps_connection_failures():
     c = client()
     c._host = "seestar.local"
-    with pytest.raises(DeviceUnavailable):
-        with c._map_errors():
-            raise ConnectionResetError("gone")
+    with pytest.raises(DeviceUnavailable), c._map_errors():
+        raise ConnectionResetError("gone")
     # smbprotocol wraps connect failures in ValueError — the routine
     # powered-off-telescope case must map to DeviceUnavailable, not crash
-    with pytest.raises(DeviceUnavailable):
-        with c._map_errors():
-            raise ValueError("Failed to connect to 'seestar.local:445': timed out")
+    with pytest.raises(DeviceUnavailable), c._map_errors():
+        raise ValueError("Failed to connect to 'seestar.local:445': timed out")
     # FileNotFoundError must pass through untouched (stat contract)
-    with pytest.raises(FileNotFoundError):
-        with c._map_errors():
-            raise FileNotFoundError("missing")
+    with pytest.raises(FileNotFoundError), c._map_errors():
+        raise FileNotFoundError("missing")
 
 
 def test_traversal_rejection_still_fails_loud():

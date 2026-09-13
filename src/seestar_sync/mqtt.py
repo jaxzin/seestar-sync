@@ -8,10 +8,11 @@ liveness via the availability topic's Last Will.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
-from typing import Callable
+from collections.abc import Callable
 
 from .config import Config
 from .models import ProgressEvent, RunSummary
@@ -93,10 +94,8 @@ class MqttReporter:
             # online forever. Flush the offline publish to the wire first.
             info = self._client.publish(self._topic("availability"), "offline",
                                         retain=True)
-            try:
+            with contextlib.suppress(Exception):  # best-effort flush
                 info.wait_for_publish(timeout=2.0)
-            except Exception:  # noqa: BLE001 — best-effort flush
-                pass
             self._client.disconnect()
             self._client.loop_stop()
         except Exception as e:  # noqa: BLE001

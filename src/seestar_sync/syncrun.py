@@ -15,7 +15,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .archive import Archive, VerifyError
 from .classify import active_folders, top_folder
@@ -47,7 +47,7 @@ def _heartbeat_line(path: str, written: int, size: int) -> str:
 
 
 def iso(ts: float) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def run_sync(
@@ -131,7 +131,7 @@ def _copy_phase(
     notify, report_summary
 ) -> bool:
     """Returns True if the device vanished mid-phase."""
-    is_synced = lambda f: manifest.verified_ok(f.path, f.size, f.mtime)  # noqa: E731
+    is_synced = lambda f: manifest.verified_ok(f.path, f.size, f.mtime)
     plan = plan_copies(files, is_synced, active)
     files_total = len(plan)
     bytes_total = sum(f.size for f in plan)
@@ -164,7 +164,9 @@ def _copy_phase(
         base = bytes_done  # bytes from files already completed this pass
         emit_state = {"last": base, "hb": time.monotonic()}
 
-        def _tick(written: int, _f=f) -> None:
+        def _tick(
+            written: int, _f=f, base=base, emit_state=emit_state, files_done=files_done,
+        ) -> None:
             # This runs inside write_stream's teardown-on-exception scope, where a
             # raise would unlink the .part and abort the transfer. Telemetry must
             # never corrupt a copy, so swallow any reporter/observer fault here.
@@ -183,7 +185,7 @@ def _copy_phase(
                 if written < _f.size and t - emit_state["hb"] >= _COPY_HEARTBEAT_SECONDS:
                     emit_state["hb"] = t
                     log.info("%s", _heartbeat_line(_f.path, written, _f.size))
-            except Exception:  # noqa: BLE001 — telemetry must not fail a copy
+            except Exception:
                 log.debug("progress reporting raised; copy continues", exc_info=True)
 
         try:

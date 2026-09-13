@@ -91,6 +91,6 @@ def test_reporters_never_raise(tmp_path, monkeypatch):
 
 
 def test_ha_webhook_reporter_is_gone():
-    import seestar_sync.reporters as reporters
+    from seestar_sync import reporters
 
     assert not hasattr(reporters, "post_ha_webhook")

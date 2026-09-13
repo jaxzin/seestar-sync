@@ -51,12 +51,12 @@ def test_manifest_is_the_only_sqlite_connection():
 
     src = pathlib.Path(__file__).resolve().parents[1] / "src" / "seestar_sync"
     offenders = [
-        f"{p.name}:{n}"
+        p.name
         for p in src.rglob("*.py")
-        for n, line in enumerate(p.read_text().splitlines(), 1)
+        for line in p.read_text().splitlines()
         if "sqlite3.connect(" in line and not line.lstrip().startswith("#")
     ]
-    assert offenders == ["manifest.py:46"], (
+    assert offenders == ["manifest.py"], (
         f"direct sqlite3.connect outside Manifest.__init__: {offenders} — route "
         "all access through Manifest so journal_mode=TRUNCATE is applied"
     )
@@ -93,9 +93,8 @@ def test_mark_deleted_is_audited(tmp_path):
 
 def test_mark_deleted_without_row_refuses(tmp_path):
     # write-ahead audit must be self-enforcing, not caller-dependent
-    with make(tmp_path) as m:
-        with pytest.raises(LookupError, match="no manifest row"):
-            m.mark_deleted("ghost.fit", tier=1, deleted_at="2026-07-09T02:00:00Z")
+    with make(tmp_path) as m, pytest.raises(LookupError, match="no manifest row"):
+        m.mark_deleted("ghost.fit", tier=1, deleted_at="2026-07-09T02:00:00Z")
 
 
 def test_recopy_clears_delete_audit(tmp_path):
