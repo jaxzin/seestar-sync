@@ -290,3 +290,81 @@ def test_debug_level_keeps_third_party_loggers_verbose(tmp_path):
     logging.getLogger("smbprotocol").setLevel(logging.NOTSET)  # reset from prior test
     run_cli(tmp_path, "run", "--init", extra_env={"LOG_LEVEL": "DEBUG"})
     assert logging.getLogger("smbprotocol").level == logging.NOTSET
+
+
+def _snapshot(root):
+    return {
+        p.relative_to(root).as_posix(): (
+            p.stat().st_size, p.stat().st_mtime_ns,
+            hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None,
+        )
+        for p in sorted(root.rglob("*"))
+    }
+
+
+def _shadow_fixture(tmp_path):
+    """A NAS-daemon-populated archive whose settings.json arms deletion, and
+    a device far over the reclaim trigger with every file verified."""
+    from seestar_sync.settings import SettingsStore
+
+    d = FakeDevice(capacity=100)
+    for i in range(4):
+        d.put(f"M 81_sub/Light_{i}_20250101-00000{i}.fit", b"x" * 20, mtime=float(i))
+    assert run_cli(tmp_path, "run", "--init", device=d) == 0  # normal mode copies
+    store = SettingsStore(tmp_path / "archive" / ".seestar-sync" / "settings.json")
+    store.set("dry_run", False, "2026-07-10T00:00:00Z")
+    store.set("reclaim_enabled", True, "2026-07-10T00:00:00Z")
+    d.put("M 42_sub/Light_new_20250201-000000.fit", b"y" * 5, mtime=9.0)  # uncopied
+    return d
+
+
+def test_shadow_mode_never_deletes_or_writes_archive(tmp_path):
+    d = _shadow_fixture(tmp_path)
+    root = tmp_path / "archive"
+    before_device = d.list_files()
+    before = _snapshot(root)
+
+    def forbid(*a, **k):
+        raise AssertionError("device delete attempted in shadow mode")
+
+    d.delete_file = forbid
+    d.remove_dir_if_empty = forbid
+    for _ in range(2):  # the second pass would see a first-pass write
+        assert run_cli(tmp_path, "run", device=d,
+                       extra_env={"SHADOW_MODE": "true"}) == 0
+    assert d.list_files() == before_device
+    assert _snapshot(root) == before
+
+
+def test_shadow_mode_missing_manifest_exits_nonzero(tmp_path, capsys):
+    d = FakeDevice()
+    assert run_cli(tmp_path, "run", "--init", device=d) == 0
+    db = tmp_path / "archive" / ".seestar-sync" / "manifest.db"
+    for p in db.parent.glob("manifest.db*"):
+        p.unlink()
+    assert run_cli(tmp_path, "run", device=d, extra_env={"SHADOW_MODE": "true"}) == 2
+    assert "manifest.db" in capsys.readouterr().err
+    assert not db.exists()
+
+
+def test_shadow_mode_unreachable_device_writes_nothing(tmp_path):
+    from seestar_sync.device import DeviceUnavailable
+
+    _shadow_fixture(tmp_path)
+    before = _snapshot(tmp_path / "archive")
+
+    def dead(cfg):
+        raise DeviceUnavailable("off")
+
+    assert run_cli(tmp_path, "run", device_factory=dead,
+                   extra_env={"SHADOW_MODE": "true"}) == 0
+    assert _snapshot(tmp_path / "archive") == before
+
+
+def test_shadow_mode_refuses_archive_mutating_commands(tmp_path, capsys):
+    _shadow_fixture(tmp_path)
+    before = _snapshot(tmp_path / "archive")
+    assert run_cli(tmp_path, "run", "--init", extra_env={"SHADOW_MODE": "true"}) == 2
+    assert run_cli(tmp_path, "rebuild-manifest", extra_env={"SHADOW_MODE": "true"}) == 2
+    assert "SHADOW_MODE" in capsys.readouterr().err
+    assert _snapshot(tmp_path / "archive") == before

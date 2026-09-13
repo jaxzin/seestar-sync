@@ -34,8 +34,9 @@ _VALIDATORS = {
 
 
 class SettingsStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, read_only: bool = False):
         self._path = path
+        self.read_only = read_only
 
     def load(self) -> dict[str, object]:
         """Validated overrides; {} on missing/corrupt (fail-safe to env)."""
@@ -61,6 +62,8 @@ class SettingsStore:
     def set(self, key: str, value: object, now_iso: str) -> None:
         if key not in OVERRIDE_KEYS:
             raise ValueError(f"unknown settings key: {key!r}")
+        if self.read_only:
+            raise PermissionError("settings.json is read-only in SHADOW_MODE")
         if not _VALIDATORS[key](value):
             raise ValueError(f"invalid value for {key}: {value!r}")
         try:
@@ -77,7 +80,14 @@ class SettingsStore:
 
 
 def resolve_effective(config: Config, store: SettingsStore) -> tuple[Config, dict[str, str]]:
-    """Overrides > env, snapshotted. Returns (effective config, source map)."""
+    """Overrides > env, snapshotted. Returns (effective config, source map).
+
+    In shadow mode overrides are ignored entirely: the archive's settings.json
+    belongs to the instance that owns the archive, and honoring it would let
+    that instance's dry_run=false/reclaim_enabled=true re-arm deletion here.
+    """
+    if config.shadow_mode:
+        return config, dict.fromkeys(OVERRIDE_KEYS, "shadow mode")
     overrides = store.load()
     sources = {
         key: ("mqtt override" if key in overrides else "env") for key in OVERRIDE_KEYS

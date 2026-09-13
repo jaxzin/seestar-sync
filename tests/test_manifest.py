@@ -123,3 +123,26 @@ def test_persistence_across_reopen(tmp_path):
         m.record_verified("a.fit", 100, 1000.0, "abc", "2026-07-09T00:00:00Z")
     with make(tmp_path) as m2:
         assert m2.verified_ok("a.fit", 100, 1000.0)
+
+
+def test_read_only_manifest_never_writes(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "manifest.db"
+    with Manifest(db) as m:
+        m.record_verified("M 81_sub/a.fit", 100, 1000.0, "abc", "2026-07-09T00:00:00Z")
+    (tmp_path / "manifest.db-journal").unlink()
+    before = {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in tmp_path.iterdir()}
+    with Manifest(db, read_only=True) as m:
+        assert m.verified_ok("M 81_sub/a.fit", 100, 1000.0)
+        assert m.failure_count("M 81_sub/a.fit") == 0
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            m.bump_failure("x")
+    after = {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in tmp_path.iterdir()}
+    assert after == before  # no journal created, db untouched
+
+
+def test_read_only_manifest_missing_is_an_error_not_a_create(tmp_path):
+    with pytest.raises(FileNotFoundError, match="manifest.db"):
+        Manifest(tmp_path / "meta" / "manifest.db", read_only=True)
+    assert not (tmp_path / "meta").exists()

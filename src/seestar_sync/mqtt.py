@@ -210,6 +210,11 @@ class MqttReporter:
             else:
                 log.warning("mqtt: command for unknown key %r ignored", key)
                 return
+            if self._config.shadow_mode:
+                log.warning("mqtt: refused %s command %r: SHADOW_MODE is set, "
+                            "settings are read-only on this instance", key, value)
+                self._echo_current(key)
+                return
             from .syncrun import iso
 
             old = self._store.load().get(key, "<unset>")

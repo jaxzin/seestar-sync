@@ -33,9 +33,15 @@ def _default_device_factory(config: Config) -> DeviceClient:
     return SmbDeviceClient(config.seestar_host, capacity_gb=config.device_capacity_gb)
 
 
+def _refuse_in_shadow_mode(config: Config, what: str) -> None:
+    if config.shadow_mode:
+        raise ArchiveError(f"{what} writes the archive; refused because SHADOW_MODE is set")
+
+
 def _prepare(config: Config, init: bool) -> Archive:
     archive = Archive(config.archive_dir)
     if init:
+        _refuse_in_shadow_mode(config, "--init")
         archive.init(allow_root_fs=config.archive_on_root_fs_ok)
     archive.check_ready(allow_root_fs=config.archive_on_root_fs_ok)
     return archive
@@ -51,7 +57,14 @@ def _one_run(config: Config, archive: Archive, device_factory,
     # propagates to main's handler → exit 2 (crash-loud; the restart loop +
     # Kuma silence alert the operator).
     archive.check_ready(allow_root_fs=config.archive_on_root_fs_ok)
-    store = SettingsStore(archive.meta_dir / "settings.json")
+    manifest_path = archive.meta_dir / "manifest.db"
+    if config.shadow_mode and not manifest_path.is_file():
+        # checked before connecting so an unreachable device can't mask it
+        raise ArchiveError(
+            f"{manifest_path} missing; SHADOW_MODE never creates the manifest "
+            "(is ARCHIVE_DIR the archive the primary instance maintains?)"
+        )
+    store = SettingsStore(archive.meta_dir / "settings.json", read_only=config.shadow_mode)
     effective, sources = resolve_effective(config, store)
     for key in OVERRIDE_KEYS:
         if sources[key] == "mqtt override":
@@ -75,7 +88,7 @@ def _one_run(config: Config, archive: Archive, device_factory,
         if mqtt is not None:
             mqtt.publish_summary(summary, effective, sources)
         return 0
-    with Manifest(archive.meta_dir / "manifest.db") as manifest:
+    with Manifest(manifest_path, read_only=config.shadow_mode) as manifest:
         summary = run_sync(device, archive, manifest, effective,
                            should_stop=should_stop, observer=observer,
                            on_summary=on_summary)
@@ -110,7 +123,7 @@ def _cmd_daemon(config: Config, args, device_factory) -> int:
 
     from .mqtt import MqttReporter
 
-    store = SettingsStore(archive.meta_dir / "settings.json")
+    store = SettingsStore(archive.meta_dir / "settings.json", read_only=config.shadow_mode)
     mqtt = MqttReporter(config, store) if config.mqtt_host else None
     if mqtt is not None:
         mqtt.start()
@@ -160,6 +173,7 @@ def _cmd_status(config: Config, args, device_factory) -> int:
 
 
 def _cmd_rebuild_manifest(config: Config, args, device_factory) -> int:
+    _refuse_in_shadow_mode(config, "rebuild-manifest")
     archive = Archive(config.archive_dir)
     archive.check_ready(allow_root_fs=config.archive_on_root_fs_ok)
     myworks = config.archive_dir / "MyWorks"
