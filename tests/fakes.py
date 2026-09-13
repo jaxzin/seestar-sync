@@ -84,3 +84,31 @@ class FakeDevice:
         self._check_connection()
         used = sum(len(data) for data, _ in self._files.values())
         return DiskUsage(total_bytes=self.capacity, free_bytes=self.capacity - used)
+
+
+def strand_hot_journal(db_path) -> None:
+    """Leave ``db_path`` exactly as a primary that crashed mid-transaction does:
+    the db file plus a non-empty rollback journal SQLite must replay before any
+    read. A read-only connection cannot replay it (SQLITE_READONLY_ROLLBACK)."""
+    import shutil
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    db_path = Path(db_path)
+    journal = Path(f"{db_path}-journal")
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = sqlite3.connect(db_path, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=TRUNCATE")
+        conn.execute("PRAGMA cache_size=1")  # spill pages so the db file is dirty
+        conn.execute("CREATE TABLE IF NOT EXISTS _crash (b BLOB)")
+        conn.execute("BEGIN")
+        for _ in range(200):
+            conn.execute("INSERT INTO _crash VALUES (?)", (b"x" * 4000,))
+        shutil.copy(db_path, Path(tmp) / "db")
+        shutil.copy(journal, Path(tmp) / "journal")
+        conn.execute("ROLLBACK")
+        conn.close()
+        shutil.copy(Path(tmp) / "db", db_path)
+        shutil.copy(Path(tmp) / "journal", journal)
+    assert journal.stat().st_size > 0

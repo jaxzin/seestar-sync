@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = 5.0
 # Kuma alerts on silence; partial/error runs deliberately don't ping.
-_KUMA_OK_RESULTS = {"ok", "skipped_unreachable"}
+_KUMA_OK_RESULTS = {"ok", "skipped_unreachable", "skipped_manifest_busy"}
 
 
 def _guard(name: str, fn, *args) -> None:
