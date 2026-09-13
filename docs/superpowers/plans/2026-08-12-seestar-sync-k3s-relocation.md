@@ -730,9 +730,9 @@ skipped_unreachable too."
 git push -u origin claude/seestar-sync-monitor
 ```
 
-- [ ] **Step 6: After merge, verify the monitor exists and is red**
+- [ ] **Step 6: After merge, verify the monitor exists and is paused**
 
-The converge Job runs on sync. Once it completes, the monitor should exist and be **DOWN** — nothing is pinging it yet. That is correct at this stage; it goes green in Task 8.
+The converge Job runs on sync. Once it completes, the monitor should exist and be **paused**. It is declared `active: false` (uptime-kuma#66): the Pushover notification applies to every monitor, so an active monitor with nothing pinging it would page within ~30 min. Task 8 removes `active: false`.
 
 ---
 
@@ -1132,6 +1132,7 @@ Expected: no output beyond files the *Mac* daemon touched. A `.part` file or a n
 
 **Files:**
 - Modify: `platform/seestar-sync/seestar-sync.yaml`
+- Modify: `fallen-leaf/uptime-kuma` `deploy/monitors.yaml` — **remove `active: false` from "Seestar Sync"** in the same cutover, or the monitor stays silently paused and a dead daemon goes unnoticed.
 
 - [ ] **Step 1: Stop the Mac daemon**
 
