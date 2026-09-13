@@ -368,3 +368,66 @@ def test_shadow_mode_refuses_archive_mutating_commands(tmp_path, capsys):
     assert run_cli(tmp_path, "rebuild-manifest", extra_env={"SHADOW_MODE": "true"}) == 2
     assert "SHADOW_MODE" in capsys.readouterr().err
     assert _snapshot(tmp_path / "archive") == before
+
+
+def test_shadow_mode_hot_journal_skips_pass_cleanly(tmp_path, caplog, capsys):
+    import logging
+
+    from tests.fakes import strand_hot_journal
+
+    d = _shadow_fixture(tmp_path)
+    root = tmp_path / "archive"
+    strand_hot_journal(root / ".seestar-sync" / "manifest.db")
+    before = _snapshot(root)
+    before_device = d.list_files()
+    caplog.set_level(logging.WARNING, logger="seestar_sync")
+    for _ in range(2):  # retried next pass, same clean skip
+        assert run_cli(tmp_path, "run", device=d,
+                       extra_env={"SHADOW_MODE": "true"}) == 0
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING
+                and "hot journal" in r.getMessage()]
+    assert len(warnings) == 2
+    assert all(r.exc_info is None for r in warnings)
+    assert "Traceback" not in capsys.readouterr().err
+    assert _snapshot(root) == before  # journal left for the primary to replay
+    assert d.list_files() == before_device
+
+
+def test_shadow_mode_hot_journal_reports_skip_to_mqtt_and_kuma(tmp_path, monkeypatch):
+    from seestar_sync.archive import Archive
+    from seestar_sync.cli import _one_run
+    from seestar_sync.config import Config
+    from tests.fakes import strand_hot_journal
+
+    d = _shadow_fixture(tmp_path)
+    root = tmp_path / "archive"
+    strand_hot_journal(root / ".seestar-sync" / "manifest.db")
+    pings = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("seestar_sync.reporters.urllib.request.urlopen",
+                        lambda url, timeout=None: pings.append(url) or _Resp())
+
+    class StubMqtt:
+        handle_progress = handle_summary = None
+
+        def __init__(self):
+            self.summaries = []
+
+        def publish_summary(self, summary, effective, sources):
+            self.summaries.append(summary)
+
+    cfg = Config.from_env({"SEESTAR_HOST": "h", "ARCHIVE_DIR": str(root),
+                           "ARCHIVE_ON_ROOT_FS_OK": "true", "SHADOW_MODE": "true",
+                           "KUMA_PUSH_URL": "http://kuma.local/api/push/t"})
+    mqtt = StubMqtt()
+    assert _one_run(cfg, Archive(root), lambda c: d, mqtt=mqtt) == 0
+    assert [s.result for s in mqtt.summaries] == ["skipped_manifest_busy"]
+    assert mqtt.summaries[0].dry_run is True
+    assert len(pings) == 1 and "status=up" in pings[0]

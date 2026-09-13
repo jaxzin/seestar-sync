@@ -55,9 +55,10 @@ def test_kuma_pings_only_on_ok_results(monkeypatch):
     url = "http://kuma.local/api/push/token123"
     ping_kuma(url, summary(result="ok"))
     ping_kuma(url, summary(result="skipped_unreachable"))
+    ping_kuma(url, summary(result="skipped_manifest_busy"))
     ping_kuma(url, summary(result="partial"))
     ping_kuma(url, summary(result="error"))
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert all("status=up" in c for c in calls)
 
 

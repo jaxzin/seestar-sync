@@ -146,3 +146,44 @@ def test_read_only_manifest_missing_is_an_error_not_a_create(tmp_path):
     with pytest.raises(FileNotFoundError, match="manifest.db"):
         Manifest(tmp_path / "meta" / "manifest.db", read_only=True)
     assert not (tmp_path / "meta").exists()
+
+
+def test_read_only_open_on_hot_journal_raises_manifest_busy(tmp_path):
+    from seestar_sync.manifest import ManifestBusy
+    from tests.fakes import strand_hot_journal
+
+    db = tmp_path / "manifest.db"
+    Manifest(db).close()
+    strand_hot_journal(db)
+    before = (db.read_bytes(), (tmp_path / "manifest.db-journal").read_bytes())
+    # surfaced at open (not at some later query inside the sync pass)
+    with pytest.raises(ManifestBusy, match="hot journal"):
+        Manifest(db, read_only=True)
+    assert (db.read_bytes(), (tmp_path / "manifest.db-journal").read_bytes()) == before
+
+
+def test_read_write_open_still_rolls_back_hot_journal(tmp_path):
+    from tests.fakes import strand_hot_journal
+
+    db = tmp_path / "manifest.db"
+    Manifest(db).close()
+    strand_hot_journal(db)
+    with Manifest(db) as m:  # normal mode unchanged: SQLite replays the journal
+        assert m.get("nope") is None
+
+
+def test_read_only_open_propagates_non_transient_errors(tmp_path):
+    import os
+    import sqlite3
+
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file permissions")
+
+    db = tmp_path / "manifest.db"
+    Manifest(db).close()
+    db.chmod(0)  # unreadable: not something the primary will clear
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            Manifest(db, read_only=True)
+    finally:
+        db.chmod(0o644)

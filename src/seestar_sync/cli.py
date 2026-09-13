@@ -1,5 +1,5 @@
 """CLI: daemon | run | status | rebuild-manifest. Exit codes per spec:
-0 ok/skipped_unreachable, 1 run-with-errors, 2 fatal (config/archive)."""
+0 ok/skipped_unreachable/skipped_manifest_busy, 1 run-with-errors, 2 fatal (config/archive)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from collections.abc import Callable, Mapping
 from .archive import Archive, ArchiveError
 from .config import Config, ConfigError
 from .device import DeviceClient
-from .manifest import Manifest
+from .manifest import Manifest, ManifestBusy
 from .reporters import report_all
 from .settings import OVERRIDE_KEYS, SettingsStore, resolve_effective
 from .syncrun import iso, run_sync
@@ -76,19 +76,28 @@ def _one_run(config: Config, archive: Archive, device_factory,
 
     observer = mqtt.handle_progress if mqtt is not None else None
     on_summary = mqtt.handle_summary if mqtt is not None else None
-    try:
-        device = device_factory(effective)
-    except DeviceUnavailable:
+    def _skip(result: str) -> int:
         from .models import RunSummary
 
-        summary = RunSummary(started_at=iso(time.time()), result="skipped_unreachable",
+        summary = RunSummary(started_at=iso(time.time()), result=result,
                              dry_run=effective.dry_run,
                              reclaim_enabled=effective.reclaim_enabled)
         report_all(effective, archive.meta_dir, summary)
         if mqtt is not None:
             mqtt.publish_summary(summary, effective, sources)
         return 0
-    with Manifest(manifest_path, read_only=config.shadow_mode) as manifest:
+
+    try:
+        device = device_factory(effective)
+    except DeviceUnavailable:
+        return _skip("skipped_unreachable")
+    try:
+        manifest = Manifest(manifest_path, read_only=config.shadow_mode)
+    except ManifestBusy as e:
+        # only a read-only open raises this; normal mode replays hot journals
+        log.warning("skipping pass, will retry next pass: %s", e)
+        return _skip("skipped_manifest_busy")
+    with manifest:
         summary = run_sync(device, archive, manifest, effective,
                            should_stop=should_stop, observer=observer,
                            on_summary=on_summary)
