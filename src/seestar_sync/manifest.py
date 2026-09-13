@@ -41,6 +41,12 @@ class ManifestRow:
     deleted_tier: int | None
 
 
+class ManifestBusy(Exception):
+    """A read-only (SHADOW_MODE) open found manifest.db in a state only its
+    owner can resolve (e.g. a hot journal left by a crashed primary). Transient:
+    the caller should skip the pass and retry, never write."""
+
+
 class Manifest:
     def __init__(self, db_path: Path, read_only: bool = False):
         if read_only:
@@ -59,6 +65,27 @@ class Manifest:
         # the package's ONLY sqlite3.connect (see test_manifest_is_the_only_...)
         self._conn = sqlite3.connect(target, uri=uri)
         if read_only:
+            # Probe now so an unreadable manifest surfaces here, not as an
+            # uncaught error from the first query deep inside the sync pass.
+            # A hot journal needs a rollback, which a mode=ro connection cannot
+            # perform (SQLITE_READONLY_ROLLBACK); a primary mid-commit can also
+            # hold the lock (SQLITE_BUSY). Both clear once the primary opens or
+            # commits. Any other error propagates (fatal, exit 2).
+            try:
+                self._conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            except sqlite3.OperationalError as e:
+                self._conn.close()
+                code = getattr(e, "sqlite_errorname", "")
+                if code == "SQLITE_READONLY_ROLLBACK":
+                    cause = "hot journal left by the primary instance"
+                elif code in ("SQLITE_BUSY", "SQLITE_LOCKED"):
+                    cause = "locked by the primary instance"
+                else:  # anything else is not a transient the primary will clear
+                    raise
+                raise ManifestBusy(
+                    f"{db_path}: {cause}; read-only open cannot proceed until the "
+                    f"primary resolves it ({code})"
+                ) from e
             return
         # The archive is a network share. SQLite's default DELETE journal mode
         # UNLINKS the rollback journal at commit, and delete-while-open is exactly

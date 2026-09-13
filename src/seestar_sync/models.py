@@ -38,7 +38,7 @@ class Tier(IntEnum):
 @dataclass
 class RunSummary:
     started_at: str  # ISO 8601 UTC
-    result: str  # ok | partial | skipped_unreachable | error
+    result: str  # ok | partial | skipped_unreachable | skipped_manifest_busy | error
     dry_run: bool = False
     reclaim_enabled: bool = False  # machine-readable copy-only signal
     files_copied: int = 0
