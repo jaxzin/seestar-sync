@@ -1,0 +1,91 @@
+name: Build & push image
+
+# DAEMONLESS build via kaniko. This fleet's runners deliberately give job
+# containers NO docker daemon (a job that can drive the daemon is root on the
+# node — homelab-cluster#100). So `docker build` cannot run here; kaniko builds
+# AND pushes over plain registry HTTP with no daemon, running AS the job
+# container (fallen-leaf/kaniko-runner). Registry auth = the org-level
+# REGISTRY_* secrets. Adapted from fallen-leaf/obsidian-mcp's build-images.yml.
+#
+# amd64 ONLY for now: kaniko cannot cross-build, so this runs on an X64 runner
+# and the Deployment pins amd64. obsidian-mcp has since gone multi-arch to
+# remove the single-amd64-worker SPOF; the same move applies here later.
+#
+# kaniko's image has no node, so `actions/checkout` cannot run in it; the build
+# uses kaniko's built-in authenticated git context instead (no checkout step —
+# deliberate, not an omission).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'README.md'
+      - '.gitea/workflows/build-images.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'README.md'
+      - '.gitea/workflows/build-images.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: "Build & push seestar-sync (amd64, kaniko)"
+    runs-on: [linux, X64]
+    container:
+      image: ${{ secrets.REGISTRY_HOSTNAME }}/fallen-leaf/kaniko-runner:latest
+      credentials:
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_TOKEN }}
+    steps:
+      - name: Build and push seestar-sync
+        env:
+          REGISTRY: ${{ secrets.REGISTRY_HOSTNAME }}
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          # kaniko reads these for an authenticated git context.
+          GIT_USERNAME: ${{ secrets.REGISTRY_USER }}
+          GIT_PASSWORD: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          mkdir -p /kaniko/.docker
+          # Written, never echoed. Do NOT add `set -x` to this step.
+          auth=$(printf '%s:%s' "$REGISTRY_USER" "$REGISTRY_TOKEN" | base64 | tr -d '\n')
+          printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$auth" > /kaniko/.docker/config.json
+
+          img="$REGISTRY/fallen-leaf/seestar-sync"
+          # PR builds validate the Dockerfile without publishing. `:latest` is
+          # authoritative only from main; every other build publishes just the
+          # immutable commit-sha tag so it never clobbers `:latest`.
+          if [ "${{ gitea.event_name }}" = "pull_request" ]; then
+            set -- --no-push
+          elif [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            set -- --destination "$img:latest" --destination "$img:${{ gitea.sha }}"
+          else
+            set -- --destination "$img:${{ gitea.sha }}"
+          fi
+
+          # The registry host is the Gitea host, so the git context uses it too.
+          /kaniko/executor \
+            --context "git://$REGISTRY/fallen-leaf/seestar-sync.git#${{ gitea.sha }}" \
+            --dockerfile "Dockerfile" \
+            --custom-platform "linux/amd64" \
+            --digest-file /kaniko/digest.txt \
+            "$@"
+
+          # Record the pushed digest (Task 7 pins it). Skipped on --no-push.
+          if [ "${{ gitea.event_name }}" != "pull_request" ]; then
+            printf '## seestar-sync (amd64)\n- `%s@%s`\n' \
+              "$img" "$(cat /kaniko/digest.txt)" \
+              >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
