@@ -1,0 +1,370 @@
+# Converges/validates the Seestar S30's UniFi fixed-IP reservation (tofu/network config,
+# consuming fallen-leaf/terraform-unifi-reservation pinned to a commit SHA).
+#
+# Jobs:
+#   validate — fmt + init(-backend=false) + validate; every push/PR.
+#   plan     — drift detection (tofu plan -detailed-exitcode): main pushes,
+#              daily cron, and manual dispatch. Exit 2 (drift) fails loudly.
+#              With dispatch input apply=true, applies instead.
+#
+# Secrets: ONE factory-provisioned AppRole, not two.
+#
+#   SEESTAR_SYNC_APPROLE_ROLE_ID / _SECRET_ID  (repo secrets)
+#     The cip-seestar-sync role, minted AND DELIVERED by openbao-infra's CI
+#     provisioner — declared in its ci-provisioner-consumers.yml, with the three
+#     cross-namespace reads below authorised as (b) grants in
+#     ci-provisioner-allowlist.yml. Nothing here is hand-minted and there is no
+#     secret_id for a human to paste anywhere.
+#
+#       secret/infra/gitea/ci-read   token       read access to the private
+#                                                terraform-unifi-reservation repo
+#                                                (both jobs — tofu init clones it)
+#       secret/infra/b2/tofu-state   key_id,application_key,endpoint,region,bucket
+#       secret/infra/unifi/tofu      username,password   the shared `tofu` account
+#
+# WHY NOT tower1-setup's TWO-ROLE SHAPE. tower1 authenticates with the org-wide
+# ci-runner role for gitea/b2, then with a separately hand-minted `unifi-ci` role
+# for the UniFi credential, whose role_id/secret_id someone pastes into Gitea.
+# The rule behind that split (role-per-dangerous-credential, homelab-netboot pi2
+# spec §4) is that the SHARED ci-runner role must not carry DHCP-layer admin.
+#
+# A single per-repo role honours that rule MORE strictly, not less: the UniFi
+# credential becomes unreachable from any org-wide role, and is reachable only
+# from the one repo that manages the reservation. It also removes the paste —
+# Brian 2026-08-23: "no manual IaC, CI only — even one-offs are a workflow so
+# they are monitored and preserved for forensics."
+#
+# Each read is a bootstrap gate: until the openbao-infra grant is merged and the
+# factory has run, the affected step fails with a message naming the fix. See
+# tofu/network/README.md.
+name: network
+on:
+  push:
+    branches: [main]
+    paths: ["tofu/network/**", ".gitea/workflows/network.yml"]
+  pull_request:
+    paths: ["tofu/network/**", ".gitea/workflows/network.yml"]
+  schedule:
+    - cron: "53 6 * * *"   # daily drift check
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Apply changes (default: plan/validate only)"
+        default: "false"
+
+env:
+  OPENBAO_ADDR: https://openbao.forest-draconis.ts.net
+  TOFU_VERSION: "1.11.6"
+  # A 401 during the module clone must FAIL, not sit waiting for a username
+  # (the cause of the 11-minute validate hangs on 2026-07-18).
+  GIT_TERMINAL_PROMPT: "0"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache OpenTofu binary
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/tofu
+          key: tofu-${{ env.TOFU_VERSION }}-${{ runner.os }}
+      - name: Install OpenTofu (on cache miss)
+        run: |
+          if ! command -v tofu >/dev/null || ! tofu version | grep -q "$TOFU_VERSION"; then
+            curl -fsSL https://get.opentofu.org/install-opentofu.sh -o /tmp/install-tofu.sh
+            sh /tmp/install-tofu.sh --install-method standalone --opentofu-version "$TOFU_VERSION" --install-path /usr/local/bin --symlink-path - >/dev/null
+          fi
+          tofu version
+      - name: Authenticate to OpenBao (AppRole)
+        id: bao_auth
+        env:
+          # role_id/secret_id go through env:, never inline in the curl
+          # command line — a shared runner's other processes can read
+          # another job's argv (security review 2026-09-13; matches
+          # unifi-gateway-setup's converge.yml).
+          ROLE_ID: ${{ secrets.SEESTAR_SYNC_APPROLE_ROLE_ID }}
+          SECRET_ID: ${{ secrets.SEESTAR_SYNC_APPROLE_SECRET_ID }}
+        run: |
+          # curl WITHOUT -f, and the pipeline split, so an HTTP error reaches the
+          # guard below instead of killing the step first.
+          #
+          # MEASURED, run 18082 (2026-08-31): the inherited `curl -sf … | jq` form
+          # died at curl's exit 22 before the `||` guard ever ran, so the log read
+          # exactly "exitcode '22': failure" and the message this step exists to
+          # print never appeared. A red run that does not say what to fix is the
+          # thing this repo refuses to ship.
+          RESP=$(jq -n '{role_id: env.ROLE_ID, secret_id: env.SECRET_ID}' \
+            | curl -s --request POST --data @- \
+                "$OPENBAO_ADDR/v1/auth/approle/login") || true
+          VAULT_TOKEN=$(printf '%s' "$RESP" | jq -r '.auth.client_token // empty' 2>/dev/null || true)
+          if [ -z "$VAULT_TOKEN" ] || [ "$VAULT_TOKEN" = "null" ]; then
+            echo "::error::BOOTSTRAP GATE: cannot log in to OpenBao as cip-seestar-sync."
+            echo "SEESTAR_SYNC_APPROLE_ROLE_ID/_SECRET_ID are not hand-minted — openbao-infra's"
+            echo "CI provisioner mints them AND writes them into this repo's Actions secrets."
+            echo "Fix: merge fallen-leaf/openbao-infra#433 (the cip-seestar-sync consumer entry"
+            echo "plus the three infra/ grants; it needs a maintainer 👍 on the reaction gate),"
+            echo "let the provisioner run, then re-run this job. Nothing to paste by hand."
+            # Safe to echo: this branch runs only when no token was returned, so
+            # RESP is an error document, not a credential.
+            echo "OpenBao replied: $(printf '%s' "$RESP" | head -c 300)"
+            exit 1
+          fi
+          echo "::add-mask::$VAULT_TOKEN"
+          echo "VAULT_TOKEN=$VAULT_TOKEN" >> $GITHUB_OUTPUT
+      - name: Configure git for the private module (tofu init clones it over HTTPS)
+        env:
+          VAULT_TOKEN: ${{ steps.bao_auth.outputs.VAULT_TOKEN }}
+        run: |
+          # A failed curl -o can leave a partial /tmp/g.json or header temp
+          # file; the trap is armed right after HDR is created so it covers
+          # every exit path below, not just the success-path rm (security
+          # review 2026-07-26, extended 2026-09-13 — the original trap named
+          # a fixed /tmp/g.hdr path that mktemp's randomized suffix never
+          # matched, so a BOOTSTRAP-GATE exit left the token-bearing header
+          # file behind). The trap does NOT remove ~/.git-credentials — the
+          # next step's `tofu init` needs it to clone the private module; the
+          # job-level "Clean up git credentials" step (if: always()) removes
+          # it once the job is done with it.
+          HDR=$(mktemp); chmod 600 "$HDR"
+          trap 'rm -f /tmp/g.json "$HDR"' EXIT
+          printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN" > "$HDR"
+          curl -sf -H @"$HDR" "$OPENBAO_ADDR/v1/secret/data/infra/gitea/ci-read" -o /tmp/g.json \
+            || { echo "BOOTSTRAP GATE: store a gitea read token at secret/infra/gitea/ci-read (field: token) with read access to fallen-leaf/terraform-unifi-reservation — see tofu/network/README.md"; exit 1; }
+          T=$(jq -r '.data.data.token // empty' /tmp/g.json)
+          [ -n "$T" ] || { echo "secret/infra/gitea/ci-read missing 'token' field"; exit 1; }
+          echo "::add-mask::$T"
+          # Credential-store file instead of an embedded-token URL in
+          # `git config`'s argv — same argv-exposure rationale as the header
+          # fixes above. Written under a restrictive umask so the token is
+          # never briefly world-readable between create and chmod (security
+          # review 2026-09-13).
+          git config --global credential.helper store
+          (umask 077; printf 'https://x-access-token:%s@gitea.forest-draconis.ts.net\n' "$T" > ~/.git-credentials)
+          printf 'Authorization: token %s\n' "$T" > "$HDR"
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H @"$HDR" \
+            -L "https://gitea.forest-draconis.ts.net/api/v1/repos/fallen-leaf/terraform-unifi-reservation")
+          [ "$code" = "200" ] || { echo "TOKEN PROBE FAILED (HTTP $code): the token in secret/infra/gitea/ci-read cannot read fallen-leaf/terraform-unifi-reservation — re-mint with read:repository scope (and access to that repo)"; exit 1; }
+      - name: fmt / init / validate (no backend)
+        working-directory: tofu/network
+        run: |
+          tofu fmt -check -diff
+          tofu init -backend=false -input=false
+          tofu validate
+      - name: Clean up git credentials
+        if: always()
+        run: |
+          rm -f ~/.git-credentials
+          git config --global --unset credential.helper || true
+
+  plan:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache OpenTofu binary
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/tofu
+          key: tofu-${{ env.TOFU_VERSION }}-${{ runner.os }}
+      - name: Install OpenTofu (on cache miss)
+        run: |
+          if ! command -v tofu >/dev/null || ! tofu version | grep -q "$TOFU_VERSION"; then
+            curl -fsSL https://get.opentofu.org/install-opentofu.sh -o /tmp/install-tofu.sh
+            sh /tmp/install-tofu.sh --install-method standalone --opentofu-version "$TOFU_VERSION" --install-path /usr/local/bin --symlink-path - >/dev/null
+          fi
+      - name: Authenticate to OpenBao (AppRole)
+        id: bao_auth
+        env:
+          # role_id/secret_id go through env:, never inline in the curl
+          # command line — a shared runner's other processes can read
+          # another job's argv (security review 2026-09-13; matches
+          # unifi-gateway-setup's converge.yml).
+          ROLE_ID: ${{ secrets.SEESTAR_SYNC_APPROLE_ROLE_ID }}
+          SECRET_ID: ${{ secrets.SEESTAR_SYNC_APPROLE_SECRET_ID }}
+        run: |
+          # curl WITHOUT -f, and the pipeline split, so an HTTP error reaches the
+          # guard below instead of killing the step first.
+          #
+          # MEASURED, run 18082 (2026-08-31): the inherited `curl -sf … | jq` form
+          # died at curl's exit 22 before the `||` guard ever ran, so the log read
+          # exactly "exitcode '22': failure" and the message this step exists to
+          # print never appeared. A red run that does not say what to fix is the
+          # thing this repo refuses to ship.
+          RESP=$(jq -n '{role_id: env.ROLE_ID, secret_id: env.SECRET_ID}' \
+            | curl -s --request POST --data @- \
+                "$OPENBAO_ADDR/v1/auth/approle/login") || true
+          VAULT_TOKEN=$(printf '%s' "$RESP" | jq -r '.auth.client_token // empty' 2>/dev/null || true)
+          if [ -z "$VAULT_TOKEN" ] || [ "$VAULT_TOKEN" = "null" ]; then
+            echo "::error::BOOTSTRAP GATE: cannot log in to OpenBao as cip-seestar-sync."
+            echo "SEESTAR_SYNC_APPROLE_ROLE_ID/_SECRET_ID are not hand-minted — openbao-infra's"
+            echo "CI provisioner mints them AND writes them into this repo's Actions secrets."
+            echo "Fix: merge fallen-leaf/openbao-infra#433 (the cip-seestar-sync consumer entry"
+            echo "plus the three infra/ grants; it needs a maintainer 👍 on the reaction gate),"
+            echo "let the provisioner run, then re-run this job. Nothing to paste by hand."
+            # Safe to echo: this branch runs only when no token was returned, so
+            # RESP is an error document, not a credential.
+            echo "OpenBao replied: $(printf '%s' "$RESP" | head -c 300)"
+            exit 1
+          fi
+          echo "::add-mask::$VAULT_TOKEN"
+          echo "VAULT_TOKEN=$VAULT_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Configure git for the private module
+        env:
+          VAULT_TOKEN: ${{ steps.bao_auth.outputs.VAULT_TOKEN }}
+        run: |
+          # A failed curl -o can leave a partial /tmp/g.json or header temp
+          # file; the trap is armed right after HDR is created so it covers
+          # every exit path below, not just the success-path rm (security
+          # review 2026-07-26, extended 2026-09-13 — the original trap named
+          # a fixed /tmp/g.hdr path that mktemp's randomized suffix never
+          # matched, so a BOOTSTRAP-GATE exit left the token-bearing header
+          # file behind). The trap does NOT remove ~/.git-credentials — the
+          # later "Plan (drift detection) or apply" step's `tofu init` needs
+          # it to clone the private module; the job-level "Clean up git
+          # credentials" step (if: always()) removes it once the job is done
+          # with it.
+          HDR=$(mktemp); chmod 600 "$HDR"
+          trap 'rm -f /tmp/g.json "$HDR"' EXIT
+          printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN" > "$HDR"
+          curl -sf -H @"$HDR" "$OPENBAO_ADDR/v1/secret/data/infra/gitea/ci-read" -o /tmp/g.json \
+            || { echo "BOOTSTRAP GATE: store a gitea read token at secret/infra/gitea/ci-read (field: token)"; exit 1; }
+          T=$(jq -r '.data.data.token // empty' /tmp/g.json)
+          [ -n "$T" ] || { echo "secret/infra/gitea/ci-read missing 'token' field"; exit 1; }
+          echo "::add-mask::$T"
+          # Credential-store file instead of an embedded-token URL in
+          # `git config`'s argv — same argv-exposure rationale as the header
+          # fixes above. Written under a restrictive umask so the token is
+          # never briefly world-readable between create and chmod (security
+          # review 2026-09-13).
+          git config --global credential.helper store
+          (umask 077; printf 'https://x-access-token:%s@gitea.forest-draconis.ts.net\n' "$T" > ~/.git-credentials)
+          printf 'Authorization: token %s\n' "$T" > "$HDR"
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H @"$HDR" \
+            -L "https://gitea.forest-draconis.ts.net/api/v1/repos/fallen-leaf/terraform-unifi-reservation")
+          [ "$code" = "200" ] || { echo "TOKEN PROBE FAILED (HTTP $code): the token in secret/infra/gitea/ci-read cannot read fallen-leaf/terraform-unifi-reservation — re-mint with read:repository scope (and access to that repo)"; exit 1; }
+
+      # No second AppRole login here. tower1-setup authenticates twice — the org
+      # ci-runner role for gitea/b2, then a separate hand-minted `unifi-ci` role
+      # for the UniFi credential. This repo uses ONE factory-provisioned role,
+      # cip-seestar-sync, scoped to exactly the three infra/ paths it reads.
+      #
+      # That is strictly tighter than the two-role arrangement it replaces. The
+      # role-per-dangerous-credential rule (homelab-netboot pi2 spec §4) exists so
+      # the SHARED ci-runner role never carries DHCP-layer admin; a per-repo role
+      # honours that better, because the UniFi credential stops being reachable
+      # from an org-wide role at all. And nothing here is hand-minted, so there is
+      # no secret_id for a human to paste — see openbao-infra's
+      # ci-provisioner-consumers.yml.
+      - name: Read UniFi credentials (cip-seestar-sync)
+        env:
+          VAULT_TOKEN: ${{ steps.bao_auth.outputs.VAULT_TOKEN }}
+        run: |
+          trap 'rm -f /tmp/unifi.json /tmp/u.hdr' EXIT
+          # Header value goes into a 0600 temp file, not curl's argv — same
+          # argv-exposure rationale as the AppRole login fix above.
+          HDR=$(mktemp /tmp/u.hdr.XXXXXX); chmod 600 "$HDR"
+          printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN" > "$HDR"
+          curl -sf -H @"$HDR" \
+            "$OPENBAO_ADDR/v1/secret/data/infra/unifi/tofu" -o /tmp/unifi.json \
+            || { echo "BOOTSTRAP GATE: cip-seestar-sync cannot read secret/infra/unifi/tofu — is the allowlist grant merged in openbao-infra and the factory re-run?"; exit 1; }
+          rm -f "$HDR"
+          U=$(jq -r '.data.data.username // empty' /tmp/unifi.json)
+          P=$(jq -r '.data.data.password // empty' /tmp/unifi.json)
+          [ -n "$U" ] && [ -n "$P" ] || { echo "secret/infra/unifi/tofu missing username/password fields"; exit 1; }
+          # Every value heredoc-delimited with a random per-run delimiter: a
+          # newline embedded in a secret must not be able to inject arbitrary
+          # env vars (e.g. BASH_ENV/LD_PRELOAD → code exec in later steps),
+          # and a secret that happens to contain a FIXED delimiter string
+          # must not be able to terminate the block early (security review
+          # 2026-07-26).
+          D="EOF_$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          echo "::add-mask::$U"
+          echo "::add-mask::$P"
+          {
+            echo "UNIFI_USERNAME<<$D"; echo "$U"; echo "$D"
+            echo "UNIFI_PASSWORD<<$D"; echo "$P"; echo "$D"
+            echo "UNIFI_API<<$D"; echo "https://192.168.10.1"; echo "$D"
+            echo "UNIFI_INSECURE<<$D"; echo "true"; echo "$D"
+          } >> $GITHUB_ENV
+
+      - name: Read state-backend credentials (B2)
+        env:
+          VAULT_TOKEN: ${{ steps.bao_auth.outputs.VAULT_TOKEN }}
+        run: |
+          # trap covers the bootstrap-gate/validation exit-1 paths below, not
+          # just the success-path rm (security review 2026-07-26).
+          trap 'rm -f /tmp/b2.json /tmp/b2.hdr' EXIT
+          # Header value goes into a 0600 temp file, not curl's argv — same
+          # argv-exposure rationale as the AppRole login fix above.
+          HDR=$(mktemp /tmp/b2.hdr.XXXXXX); chmod 600 "$HDR"
+          printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN" > "$HDR"
+          curl -sf -H @"$HDR" "$OPENBAO_ADDR/v1/secret/data/infra/b2/tofu-state" -o /tmp/b2.json \
+            || { echo "BOOTSTRAP GATE: store B2 state credentials at secret/infra/b2/tofu-state (fields: key_id, application_key, endpoint, region, bucket) — see tofu/network/README.md"; exit 1; }
+          rm -f "$HDR"
+          K=$(jq -r '.data.data.key_id // empty' /tmp/b2.json); S=$(jq -r '.data.data.application_key // empty' /tmp/b2.json)
+          [ -n "$K" ] && [ -n "$S" ] || { echo "secret/infra/b2/tofu-state missing key_id/application_key"; exit 1; }
+          echo "::add-mask::$K"
+          echo "::add-mask::$S"
+          # Heredoc-delimited with a random per-run delimiter, same rationale
+          # as the UniFi credentials step above (security review 2026-07-26).
+          D="EOF_$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          {
+            echo "AWS_ACCESS_KEY_ID<<$D"; echo "$K"; echo "$D"
+            echo "AWS_SECRET_ACCESS_KEY<<$D"; echo "$S"; echo "$D"
+            echo "B2_ENDPOINT<<$D"; jq -r '.data.data.endpoint' /tmp/b2.json; echo "$D"
+            echo "B2_REGION<<$D"; jq -r '.data.data.region' /tmp/b2.json; echo "$D"
+            echo "B2_BUCKET<<$D"; jq -r '.data.data.bucket' /tmp/b2.json; echo "$D"
+          } >> $GITHUB_ENV
+          rm -f /tmp/b2.json
+
+      - name: Plan (drift detection) or apply
+        working-directory: tofu/network
+        env:
+          # Bind the dispatch input to a shell var instead of interpolating
+          # the GitHub expression straight into the script text — a
+          # dispatch-controlled string spliced in before bash parses it is
+          # expression injection (security review 2026-07-26).
+          APPLY: ${{ github.event.inputs.apply || 'false' }}
+        run: |
+          tofu init -input=false \
+            -backend-config="bucket=$B2_BUCKET" \
+            -backend-config="region=$B2_REGION" \
+            -backend-config="endpoints={s3=\"$B2_ENDPOINT\"}"
+          # UniFi OS rate-limits POST /api/auth/login and the unifi consumers'
+          # daily plans drain out of the single runner queue together, so ~half
+          # used to 429 (homelab-cluster#271). Retry ONLY the 429, with jittered
+          # backoff (homelab-cluster#290); drift (exit 2) and every other
+          # failure still fail immediately. Copied from allsky-setup.
+          trap 'rm -f /tmp/tofu.out' EXIT
+          attempt=0
+          while :; do
+            rc=0
+            if [ "$APPLY" = "true" ]; then
+              tofu apply -input=false -auto-approve >/tmp/tofu.out 2>&1 || rc=$?
+            else
+              tofu plan -input=false -detailed-exitcode >/tmp/tofu.out 2>&1 || rc=$?
+            fi
+            cat /tmp/tofu.out
+            [ "$rc" -eq 0 ] && break
+            if [ "$rc" -eq 2 ]; then
+              echo "DRIFT DETECTED — reservation differs from declared state (run dispatch with apply=true, or fix the controller)"
+              exit 2
+            fi
+            grep -qE "Server error \(429\)|login attempt limit" /tmp/tofu.out || exit "$rc"
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 4 ]; then
+              echo "UniFi is STILL rate-limiting logins after 4 attempts — check the controller."
+              exit "$rc"
+            fi
+            delay=$((30 * (1 << attempt) + RANDOM % 30))
+            echo "UniFi login rate-limited (HTTP 429) — retrying in ${delay}s (retry $attempt of 3; homelab-cluster#271)"
+            sleep "$delay"
+          done
+      - name: Clean up git credentials
+        if: always()
+        run: |
+          rm -f ~/.git-credentials
+          git config --global --unset credential.helper || true
