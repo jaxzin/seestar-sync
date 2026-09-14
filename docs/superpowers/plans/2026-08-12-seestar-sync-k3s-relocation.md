@@ -20,6 +20,19 @@
 - **NAS is `192.168.10.7`. Telescope is `seestar.local` / `192.168.10.50`. MQTT broker is `homeassistant.iot.jaxzin.com` / `192.168.10.240`.** All on one flat `192.168.10.0/24`.
 - **The archive is irreplaceable.** No task may run the daemon with `DRY_RUN=false` against the NFS mount until Task 8.
 
+## Execution record (2026-09-14)
+
+Cutover completed **2026-09-14 05:54Z** (homelab-cluster #349 shadow, #355 cutover). The Mac compose container was stopped 05:30Z and removed after its MQTT LWT showed offline. Deviations from the plan as written:
+
+- **Kuma monitor shipped paused**, then was unpaused at cutover (uptime-kuma #66, #74); it is active and UP.
+- **`SHADOW_MODE=true` instead of a `DRY_RUN` env** for the shadow pod (seestar-sync #11, plus #13 `skipped_manifest_busy`): a hard read-only mode that also ignores `settings.json`/MQTT overrides and opens `manifest.db` read-only. Shadow gate: both instances listed 13256 files, shadow would copy 0, no archive writes.
+- **PV was read-only for the shadow, then replaced by the renamed RWX `seestar-archive-rw`** PV/PVC at cutover (NFS `192.168.10.7:/volume1/astrograph`, uid 1026/gid 100, no fsGroup).
+- **`SEESTAR_HOST` is the IP `192.168.10.50`**, not `seestar.local` (no mDNS in the pod network), backed by a UniFi fixed-IP reservation codified in `tofu/network` (#14, applied by the manual `apply=true` workflow, run #21).
+- **Task 8 Step 7 missed the HA discovery topics** — 18 `homeassistant/+/seestar-sync-k8s/#` configs were left behind and cleared by hand 2026-09-14; the step now covers them.
+- **Task 9:** README rows landed with #349/#355; tombstone baseline was 159 on 2026-09-14 (vs 113 at filing), recorded on #1 for a re-check in a few days; the Mac image and `.env` are kept pending Brian's decision.
+
+Open follow-ups: seestar-sync#12, homelab-cluster#343, uptime-kuma#67.
+
 ---
 
 ## Task 1: Generalize `roles/nfs_share` to loop over exported shares
@@ -37,7 +50,7 @@
 - Consumes: `nas.storage.shares` from `nas.yml` (loaded in `ansible/group_vars/all.yml:6-7`).
 - Produces: a role that converges *every* share carrying an `nfs_exports` key, rather than the single hardcoded `netboot`.
 
-- [ ] **Step 1: Capture the pre-refactor baseline**
+- [x] **Step 1: Capture the pre-refactor baseline**
 
 This is the safety net for the whole task. Run the existing role in validate mode and save the effective export list.
 
@@ -57,7 +70,7 @@ wc -l /tmp/nfs-baseline-surface.txt
 
 If `changed` is not 0, **stop** — the live state already differs from `nas.yml` and that must be understood before refactoring.
 
-- [ ] **Step 2: Move the role body into a looped include**
+- [x] **Step 2: Move the role body into a looped include**
 
 `git mv` preserves the history of a file that is otherwise "deleted and recreated":
 
@@ -67,7 +80,7 @@ git checkout -b claude/nfs-share-loop
 git mv ansible/roles/nfs_share/tasks/main.yml ansible/roles/nfs_share/tasks/converge_share.yml
 ```
 
-- [ ] **Step 3: Write the new looping `main.yml`**
+- [x] **Step 3: Write the new looping `main.yml`**
 
 Create `ansible/roles/nfs_share/tasks/main.yml`:
 
@@ -93,7 +106,7 @@ Create `ansible/roles/nfs_share/tasks/main.yml`:
     label: "{{ nfs_share_entry.name }}"
 ```
 
-- [ ] **Step 4: Repoint `converge_share.yml` at the loop variable**
+- [x] **Step 4: Repoint `converge_share.yml` at the loop variable**
 
 The old body derived its share by *searching* `nas.yml` for `nfs_share_lookup`. The loop already hands it the entry, so that search is now redundant indirection. Replace the derivation task at the top of `ansible/roles/nfs_share/tasks/converge_share.yml` (was `main.yml:12-25`) with:
 
@@ -112,7 +125,7 @@ The old body derived its share by *searching* `nas.yml` for `nfs_share_lookup`. 
 
 Leave every other task in the file untouched — the guards, the 7-key projection, the diff, the save, and the exact-match verify all read the `nfs_share_*` facts this sets.
 
-- [ ] **Step 5: Delete the now-dead lookup default**
+- [x] **Step 5: Delete the now-dead lookup default**
 
 Replace the whole of `ansible/roles/nfs_share/defaults/main.yml` with:
 
@@ -130,7 +143,7 @@ Replace the whole of `ansible/roles/nfs_share/defaults/main.yml` with:
 # tasks/main.yml loops every nas.yml share that declares nfs_exports.
 ```
 
-- [ ] **Step 6: Lint**
+- [x] **Step 6: Lint**
 
 ```bash
 cd ~/Projects/nas-setup && ansible-lint --profile production ansible/roles/nfs_share/
@@ -138,7 +151,7 @@ cd ~/Projects/nas-setup && ansible-lint --profile production ansible/roles/nfs_s
 
 Expected: no findings.
 
-- [ ] **Step 7: Prove the refactor is inert**
+- [x] **Step 7: Prove the refactor is inert**
 
 Re-run validate mode and diff against the baseline from Step 1:
 
@@ -153,7 +166,7 @@ Expected: `diff` reports no differences, and the run reports `changed=0`.
 
 **This is the gate. If the diff is non-empty, do not proceed — revert and investigate.** The role has no captured run-twice `changed=0` evidence today (`docs/migration-from-homelab-netboot.md:119` explicitly defers it), so this step establishes that baseline for the first time.
 
-- [ ] **Step 8: Run it twice to prove idempotency**
+- [x] **Step 8: Run it twice to prove idempotency**
 
 ```bash
 cd ~/Projects/nas-setup && ansible-playbook ansible/playbook.yml --tags nfs | tail -3
@@ -161,7 +174,7 @@ cd ~/Projects/nas-setup && ansible-playbook ansible/playbook.yml --tags nfs | ta
 
 Expected final line contains `changed=0`.
 
-- [ ] **Step 9: Commit and open the PR**
+- [x] **Step 9: Commit and open the PR**
 
 ```bash
 cd ~/Projects/nas-setup
@@ -196,7 +209,7 @@ Open a PR to `main`. Paste into the description: the Step 7 `diff` output (empty
 - Consumes: the looping `roles/nfs_share` from Task 1.
 - Produces: `192.168.10.7:/volume1/astrograph` mountable read-write from any cluster node, with uid 1026 unmapped.
 
-- [ ] **Step 1: Add the export block**
+- [x] **Step 1: Add the export block**
 
 In `nas.yml`, replace the `astrograph` entry:
 
@@ -232,7 +245,7 @@ In `nas.yml`, replace the `astrograph` entry:
 
 Leave `purpose` and `desc` byte-identical to what is there now — `desc` is at 51 characters and DSM rejects anything over 64 with a bare error 3300.
 
-- [ ] **Step 2: Validate before applying**
+- [x] **Step 2: Validate before applying**
 
 ```bash
 cd ~/Projects/nas-setup && ansible-playbook ansible/playbook.yml --tags nfs 2>&1 | tail -20
@@ -240,7 +253,7 @@ cd ~/Projects/nas-setup && ansible-playbook ansible/playbook.yml --tags nfs 2>&1
 
 Expected: the run reports a pending change for `astrograph` and **no** change for `netboot`. In validate mode nothing is written; the exact-match verify will fail for `astrograph` because the export does not exist yet. That failure is expected at this step — confirm the failure names `astrograph` and not `netboot`.
 
-- [ ] **Step 3: Commit and open the PR**
+- [x] **Step 3: Commit and open the PR**
 
 ```bash
 cd ~/Projects/nas-setup
@@ -256,7 +269,7 @@ git push -u origin claude/astrograph-nfs-export
 
 **STOP — Brian merges. The merge to `main` IS the apply** (`.gitea/workflows/converge.yml` runs with `-e converge=true` on push to main).
 
-- [ ] **Step 4: Verify the export from a cluster node — THE PHASE 0 GATE**
+- [x] **Step 4: Verify the export from a cluster node — THE PHASE 0 GATE**
 
 ```bash
 ssh nuc 'sudo mkdir -p /mnt/astro-probe && \
@@ -266,7 +279,7 @@ ssh nuc 'sudo mkdir -p /mnt/astro-probe && \
 
 Expected: `MOUNTED`, then a listing containing `seestar`.
 
-- [ ] **Step 5: Prove uid 1026 is not squashed**
+- [x] **Step 5: Prove uid 1026 is not squashed**
 
 ```bash
 ssh nuc 'sudo -u "#1026" touch /mnt/astro-probe/seestar/archive/.probe-1026 && \
@@ -277,7 +290,7 @@ Expected exactly: `jaxzin:users 1026:100`
 
 If it reports `nobody:nogroup` or `65534`, the export is squashing — **stop**, fix `root_squash`, and do not proceed.
 
-- [ ] **Step 6: Clean up the probe**
+- [x] **Step 6: Clean up the probe**
 
 ```bash
 ssh nuc 'sudo rm -f /mnt/astro-probe/seestar/archive/.probe-1026 && \
@@ -297,11 +310,11 @@ Expected: `CLEAN`, and no `.probe-1026` left behind.
 **Files:**
 - Create: `.gitea/workflows/ci.yml`
 
-- [ ] **Step 1: Transfer the repo (Brian, in the Gitea UI)**
+- [x] **Step 1: Transfer the repo (Brian, in the Gitea UI)**
 
 Settings → Danger Zone → Transfer Ownership → `fallen-leaf`. This is an admin action; it cannot be scripted with the available token.
 
-- [ ] **Step 2: Repoint the local remote**
+- [x] **Step 2: Repoint the local remote**
 
 ```bash
 cd ~/Projects/seestar-backup
@@ -312,7 +325,7 @@ git fetch origin && echo "TRANSFER OK"
 
 Expected: both remote lines show `fallen-leaf/seestar-sync`, and the fetch succeeds.
 
-- [ ] **Step 3: Write the test workflow**
+- [x] **Step 3: Write the test workflow**
 
 There is no pytest CI in this fleet to copy — `obsidian-mcp` has a test suite and no workflow that runs it. This establishes the pattern, following `obsidian-mcp/.gitea/workflows/scan.yml:40-76` for the uv setup.
 
@@ -363,7 +376,7 @@ jobs:
         run: uv run pytest -m "not live" -q
 ```
 
-- [ ] **Step 4: Verify the marker name before trusting the workflow**
+- [x] **Step 4: Verify the marker name before trusting the workflow**
 
 The `-m "not live"` filter is only correct if that is the actual marker. Check:
 
@@ -373,7 +386,7 @@ cd ~/Projects/seestar-backup && grep -rn "markers" pyproject.toml && grep -rn "@
 
 If the marker is not `live`, edit `ci.yml` to match what is actually there. Do not guess.
 
-- [ ] **Step 5: Run the suite locally first**
+- [x] **Step 5: Run the suite locally first**
 
 Reproduce CI locally before iterating through pushes:
 
@@ -383,7 +396,7 @@ cd ~/Projects/seestar-backup && uv run pytest -m "not live" -q 2>&1 | tail -5
 
 Expected: `132 passed` (or the current count), 0 failures.
 
-- [ ] **Step 6: Commit and open the PR**
+- [x] **Step 6: Commit and open the PR**
 
 ```bash
 cd ~/Projects/seestar-backup
@@ -411,7 +424,7 @@ Verify the run is picked up by the runner and goes green before asking for a mer
 **Interfaces:**
 - Produces: `gitea.forest-draconis.ts.net/fallen-leaf/seestar-sync:<sha>` and `:latest`. Task 7's Deployment pins the `<sha>` tag.
 
-- [ ] **Step 1: Write the build workflow**
+- [x] **Step 1: Write the build workflow**
 
 Copied from `fallen-leaf/obsidian-mcp/.gitea/workflows/build-images.yml`, reduced to a single image (no matrix).
 
@@ -502,7 +515,7 @@ jobs:
           fi
 ```
 
-- [ ] **Step 2: Commit and open the PR**
+- [x] **Step 2: Commit and open the PR**
 
 ```bash
 cd ~/Projects/seestar-backup
@@ -515,11 +528,11 @@ amd64 only; the pod is nodeSelector-pinned to amd64."
 git push -u origin claude/kaniko-build
 ```
 
-- [ ] **Step 3: Verify the PR build validates without publishing**
+- [x] **Step 3: Verify the PR build validates without publishing**
 
 Expected: the job goes green and the log shows kaniko running with `--no-push`. Confirm no `seestar-sync` tag appeared in the registry.
 
-- [ ] **Step 4: After merge, record the published tag**
+- [x] **Step 4: After merge, record the published tag**
 
 ```bash
 cd ~/Projects/seestar-backup && git fetch origin && git rev-parse origin/main
@@ -543,7 +556,7 @@ Note also that `policies/eso-openbao.hcl` (3 paths) is **already out of sync** w
 **Interfaces:**
 - Produces: ESO can read `secret/data/infra/seestar-sync/mqtt` and `secret/data/infra/uptime-kuma/seestar-sync-push`.
 
-- [ ] **Step 1: Capture the live policy before touching anything**
+- [x] **Step 1: Capture the live policy before touching anything**
 
 ```bash
 export VAULT_ADDR=https://openbao.forest-draconis.ts.net
@@ -553,7 +566,7 @@ grep -c '^path' /tmp/eso-openbao-before.hcl
 
 Expected: `6`. If it is not 6, the ConfigMap and live state have drifted — investigate before editing.
 
-- [ ] **Step 2: Append the two grants**
+- [x] **Step 2: Append the two grants**
 
 In `platform/openbao-config.yaml`, inside the existing `policy-eso-openbao.hcl: |` block, **after** the last existing `path` stanza and without altering any of the six already there, add:
 
@@ -582,7 +595,7 @@ In `platform/openbao-config.yaml`, inside the existing `policy-eso-openbao.hcl: 
 
 No `roles.json` entry is needed. The `eso-openbao` kubernetes-auth role already exists and its params are correct; adding a role entry would `PUT` the role too, and any drift between those params and the live ones would silently re-scope ESO's login.
 
-- [ ] **Step 3: Verify you added rather than replaced**
+- [x] **Step 3: Verify you added rather than replaced**
 
 ```bash
 cd ~/Projects/homelab-cluster
@@ -591,7 +604,7 @@ awk '/policy-eso-openbao.hcl: \|/,/^  [a-z-]+\.(hcl|json): \|/' platform/openbao
 
 Expected: `8` (the original 6 plus 2). **If it is 2, you replaced the policy instead of appending — revert.**
 
-- [ ] **Step 4: Commit and open the PR**
+- [x] **Step 4: Commit and open the PR**
 
 ```bash
 cd ~/Projects/homelab-cluster
@@ -608,7 +621,7 @@ an allowlist decision when it lands."
 git push -u origin claude/seestar-sync-eso-grant
 ```
 
-- [ ] **Step 5: After merge, verify all eight grants are live**
+- [x] **Step 5: After merge, verify all eight grants are live**
 
 ```bash
 export VAULT_ADDR=https://openbao.forest-draconis.ts.net
@@ -619,7 +632,7 @@ diff /tmp/eso-openbao-before.hcl /tmp/eso-openbao-after.hcl
 
 Expected: count is `8`, and the diff shows **only additions**, never a removal.
 
-- [ ] **Step 6: Confirm no consumer was broken**
+- [x] **Step 6: Confirm no consumer was broken**
 
 ```bash
 kubectl get externalsecrets -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,STATUS:.status.conditions[0].reason
@@ -641,7 +654,7 @@ Expected: every row reads `SecretSynced`. Any `SecretSyncedError` means a grant 
 - Consumes: nothing from earlier tasks.
 - Produces: OpenBao secret `secret/data/infra/uptime-kuma/seestar-sync-push` with keys `token` and `push_url`, where `push_url` is `https://status.jaxzin.casa/api/push/<token>`.
 
-- [ ] **Step 1: Add the token spec**
+- [x] **Step 1: Add the token spec**
 
 In `ansible/roles/uptime-kuma/defaults/main.yml`, extend `openbao_push_token_specs`:
 
@@ -653,7 +666,7 @@ openbao_push_token_specs:
     openbao_path: "infra/uptime-kuma/seestar-sync-push"
 ```
 
-- [ ] **Step 2: Seed the token by hand — ADMIN-GATED**
+- [x] **Step 2: Seed the token by hand — ADMIN-GATED**
 
 The in-cluster converge Job's policy is read-only on purpose. From the deleted `openbao-role.sh`, verbatim: *"Granting write for that one-time-per-monitor case would give a daily CronJob standing write access to the whole prefix. Instead: seed push tokens by hand … Fail-closed beats standing privilege."*
 
@@ -676,7 +689,7 @@ bao kv get -format=json secret/infra/uptime-kuma/seestar-sync-push \
 
 Expected: `keys: ['push_url', 'token']`, `token len: 32`, `url host: https://status.jaxzin.casa`.
 
-- [ ] **Step 3: Declare the monitor**
+- [x] **Step 3: Declare the monitor**
 
 In `deploy/monitors.yaml`, add under a suitable section:
 
@@ -707,7 +720,7 @@ In `deploy/monitors.yaml`, add under a suitable section:
 
 Note `tags` is informational only — the role parses it but never applies it to Kuma. It is included to match the file's convention.
 
-- [ ] **Step 4: Lint**
+- [x] **Step 4: Lint**
 
 ```bash
 cd ~/Projects/uptime-kuma && ansible-lint --profile production && python3 -c "import yaml; yaml.safe_load(open('deploy/monitors.yaml'))" && echo "YAML OK"
@@ -715,7 +728,7 @@ cd ~/Projects/uptime-kuma && ansible-lint --profile production && python3 -c "im
 
 Expected: no findings, `YAML OK`.
 
-- [ ] **Step 5: Commit and open the PR**
+- [x] **Step 5: Commit and open the PR**
 
 ```bash
 cd ~/Projects/uptime-kuma
@@ -730,7 +743,7 @@ skipped_unreachable too."
 git push -u origin claude/seestar-sync-monitor
 ```
 
-- [ ] **Step 6: After merge, verify the monitor exists and is paused**
+- [x] **Step 6: After merge, verify the monitor exists and is paused**
 
 The converge Job runs on sync. Once it completes, the monitor should exist and be **paused**. It is declared `active: false` (uptime-kuma#66): the Pushover notification applies to every monitor, so an active monitor with nothing pinging it would page within ~30 min. Task 8 removes `active: false`.
 
@@ -750,7 +763,7 @@ The converge Job runs on sync. Once it completes, the monitor should exist and b
 - Consumes: the NFS export (Task 2), the image tag (Task 4), the ESO grants (Task 5), the push secret (Task 6).
 - Produces: a running pod that **plans but never writes**, publishing to `seestar-sync-k8s/*`.
 
-- [ ] **Step 1: Seed the MQTT credential — ADMIN-GATED**
+- [x] **Step 1: Seed the MQTT credential — ADMIN-GATED**
 
 The values are in the Mac's `.env` and nowhere else. Brian runs this; read the two values from `~/Projects/seestar-backup/.env` without echoing them:
 
@@ -771,7 +784,7 @@ bao kv get -format=json secret/infra/seestar-sync/mqtt \
 
 Expected: `keys: ['password', 'username']`, `user: seestar-sync`, and a non-zero password length.
 
-- [ ] **Step 2: Write the namespace**
+- [x] **Step 2: Write the namespace**
 
 Create `platform/seestar-sync-ns.yaml`:
 
@@ -810,7 +823,7 @@ imagePullSecrets:
   - name: gitea-pull
 ```
 
-- [ ] **Step 3: Write the ArgoCD Application**
+- [x] **Step 3: Write the ArgoCD Application**
 
 Create `platform/seestar-sync.app.yaml`:
 
@@ -845,7 +858,7 @@ spec:
       - CreateNamespace=false
 ```
 
-- [ ] **Step 4: Write the ExternalSecrets**
+- [x] **Step 4: Write the ExternalSecrets**
 
 Create `platform/seestar-sync/externalsecrets.yaml`:
 
@@ -927,7 +940,7 @@ spec:
       remoteRef: { key: infra/uptime-kuma/seestar-sync-push, property: push_url }
 ```
 
-- [ ] **Step 5: Write the workload**
+- [x] **Step 5: Write the workload**
 
 Substitute `<SHA>` with the commit SHA recorded in Task 4 Step 4.
 
@@ -1067,7 +1080,7 @@ spec:
           emptyDir: {}
 ```
 
-- [ ] **Step 6: Validate the manifests before pushing**
+- [x] **Step 6: Validate the manifests before pushing**
 
 ```bash
 cd ~/Projects/homelab-cluster
@@ -1077,7 +1090,7 @@ python3 scripts/lint_sync_waves.py platform/
 
 Expected: every object validates, and the sync-wave linter passes.
 
-- [ ] **Step 7: Commit and open the PR**
+- [x] **Step 7: Commit and open the PR**
 
 ```bash
 cd ~/Projects/homelab-cluster
@@ -1091,7 +1104,7 @@ topic prefix and no Kuma URL; the cutover flips all three."
 git push -u origin claude/seestar-sync-platform
 ```
 
-- [ ] **Step 8: After merge, verify the pod is Ready and the mount worked**
+- [x] **Step 8: After merge, verify the pod is Ready and the mount worked**
 
 ```bash
 kubectl -n seestar-sync get pods -o wide
@@ -1100,7 +1113,7 @@ kubectl -n seestar-sync exec deploy/seestar-sync -- ls -la /archive/.seestar-syn
 
 Expected: pod `Running`/`Ready`, and the listing shows `ARCHIVE_MARKER`, `manifest.db`, `settings.json`, `status.json`. If the pod is `ContainerCreating` with a mount error, the export ACL is wrong — revisit Task 2.
 
-- [ ] **Step 9: THE PHASE 2 GATE — compare the shadow's plan to the Mac's**
+- [x] **Step 9: THE PHASE 2 GATE — compare the shadow's plan to the Mac's**
 
 ```bash
 kubectl -n seestar-sync logs deploy/seestar-sync --tail=40
@@ -1114,7 +1127,7 @@ docker logs --tail 40 seestar-backup-seestar-sync-1 2>&1 | grep listed
 
 **The two file counts must match.** A materially larger count from the pod means NFS-visible mtimes differ from the SMB ones and the manifest thinks files need re-copying — the ~86 GB re-copy storm the spec flags as Risk 3. Investigate before cutover.
 
-- [ ] **Step 10: Prove the shadow wrote nothing**
+- [x] **Step 10: Prove the shadow wrote nothing**
 
 ```bash
 ssh nas.local 'find /volume1/astrograph/seestar/archive -newermt "-1 hour" -type f | head'
@@ -1134,7 +1147,7 @@ Expected: no output beyond files the *Mac* daemon touched. A `.part` file or a n
 - Modify: `platform/seestar-sync/seestar-sync.yaml`
 - Modify: `fallen-leaf/uptime-kuma` `deploy/monitors.yaml` — **remove `active: false` from "Seestar Sync"** in the same cutover, or the monitor stays silently paused and a dead daemon goes unnoticed.
 
-- [ ] **Step 1: Stop the Mac daemon**
+- [x] **Step 1: Stop the Mac daemon**
 
 ```bash
 cd ~/Projects/seestar-backup && docker compose down && docker ps -a --filter name=seestar-sync --format '{{.Names}}|{{.Status}}'
@@ -1142,7 +1155,7 @@ cd ~/Projects/seestar-backup && docker compose down && docker ps -a --filter nam
 
 Expected: the container is `Exited`.
 
-- [ ] **Step 2: Confirm the Mac is dead over MQTT — THE GATE**
+- [x] **Step 2: Confirm the Mac is dead over MQTT — THE GATE**
 
 The LWT is the authority; `docker ps` only proves the container stopped, not that the broker noticed.
 
@@ -1167,7 +1180,7 @@ Expected exactly: `{'seestar-sync/availability': 'offline'}`
 
 **If it still reads `online`, do not proceed.** Wait for the LWT, or find the second instance.
 
-- [ ] **Step 3: Promote the pod**
+- [x] **Step 3: Promote the pod**
 
 In `platform/seestar-sync/seestar-sync.yaml`, replace the shadow-phase env block:
 
@@ -1185,7 +1198,7 @@ In `platform/seestar-sync/seestar-sync.yaml`, replace the shadow-phase env block
 
 Ensure the container's `envFrom` now lists **both** secrets, and that `DRY_RUN` and the `seestar-sync-k8s` prefix are gone.
 
-- [ ] **Step 4: Commit and open the PR**
+- [x] **Step 4: Commit and open the PR**
 
 ```bash
 cd ~/Projects/homelab-cluster
@@ -1199,7 +1212,7 @@ wires the Kuma push URL."
 git push -u origin claude/seestar-sync-cutover
 ```
 
-- [ ] **Step 5: After merge, verify the device is live on the production prefix**
+- [x] **Step 5: After merge, verify the device is live on the production prefix**
 
 ```bash
 cd ~/Projects/seestar-backup && .venv/bin/python /private/tmp/claude-501/*/6747d03f-4441-41c4-932d-e4da8fede33f/scratchpad/probe_mqtt.py 2>&1 | tail -8
@@ -1207,7 +1220,7 @@ cd ~/Projects/seestar-backup && .venv/bin/python /private/tmp/claude-501/*/6747d
 
 Expected: `seestar-sync/availability = online`, and `state` progressing through `idle`/`listing`/`copying`.
 
-- [ ] **Step 6: Verify the Kuma monitor goes green**
+- [x] **Step 6: Verify the Kuma monitor goes green**
 
 Within one sync interval (15 min), "Seestar Sync" in Uptime Kuma should flip from DOWN to UP. If it stays DOWN, the push URL is not reaching the pod:
 
@@ -1215,9 +1228,9 @@ Within one sync interval (15 min), "Seestar Sync" in Uptime Kuma should flip fro
 kubectl -n seestar-sync exec deploy/seestar-sync -- sh -c 'test -n "$KUMA_PUSH_URL" && echo SET || echo MISSING'
 ```
 
-- [ ] **Step 7: Clear the shadow's retained topics**
+- [x] **Step 7: Clear the shadow's retained topics**
 
-The `seestar-sync-k8s/*` topics are retained and will haunt Home Assistant as a ghost device. Clear them by publishing empty retained payloads — the same cleanup used for the `seestar-sync-livetest` prefix on 2026-07-15:
+The `seestar-sync-k8s/*` state topics **and** the `homeassistant/+/seestar-sync-k8s/#` discovery configs are retained and will haunt Home Assistant as a ghost device — clear both (the discovery topics were missed on 2026-09-14 and 18 had to be cleared by hand). Clear them by publishing empty retained payloads — the same cleanup used for the `seestar-sync-livetest` prefix on 2026-07-15:
 
 ```bash
 cd ~/Projects/seestar-backup && .venv/bin/python - <<'EOF'
@@ -1228,7 +1241,7 @@ env = dict(l.split("=", 1) for l in
 topics = set()
 c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 c.username_pw_set(env["MQTT_USERNAME"], env["MQTT_PASSWORD"])
-c.on_connect = lambda cl, u, f, rc, p=None: cl.subscribe("seestar-sync-k8s/#")
+c.on_connect = lambda cl, u, f, rc, p=None: cl.subscribe([("seestar-sync-k8s/#", 0), ("homeassistant/+/seestar-sync-k8s/#", 0)])
 c.on_message = lambda cl, u, m: topics.add(m.topic)
 c.connect(env["MQTT_HOST"], int(env.get("MQTT_PORT", 1883)), 20)
 c.loop_start(); time.sleep(6)
@@ -1239,7 +1252,7 @@ print(f"--- cleared {len(topics)} topics")
 EOF
 ```
 
-- [ ] **Step 8: Confirm zero shadow topics remain**
+- [x] **Step 8: Confirm zero shadow topics remain**
 
 Re-run Step 7's script. Expected: `--- cleared 0 topics`.
 
@@ -1251,7 +1264,7 @@ Re-run Step 7's script. Expected: `--- cleared 0 topics`.
 
 A service the inventory does not know about is undiscoverable to the next agent.
 
-- [ ] **Step 1: Add the platform README row**
+- [x] **Step 1: Add the platform README row**
 
 In `platform/README.md`'s contents table, add:
 
@@ -1260,7 +1273,7 @@ In `platform/README.md`'s contents table, add:
 | `seestar-sync.yaml` | `platform/seestar-sync/` | Seestar S30 Pro → NAS mirror daemon. Static NFS PV onto `astrograph`; single replica with `Recreate` (two daemons sharing one archive with reclaim armed is the failure to avoid). No ingress, no OIDC — liveness is a Kuma push monitor. |
 | `externalsecrets.yaml` | `platform/seestar-sync/` | `ExternalSecret`s for the `gitea-pull` dockerconfig, the MQTT broker account (`infra/seestar-sync/mqtt`), and the Kuma push URL. |
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 cd ~/Projects/homelab-cluster
@@ -1270,7 +1283,7 @@ git commit -m "docs(platform): add seestar-sync to the contents table"
 git push -u origin claude/seestar-sync-readme
 ```
 
-- [ ] **Step 3: Update the vault service map**
+- [x] **Step 3: Update the vault service map**
 
 Add `seestar-sync` to `02_reference/tools/home-infrastructure.md` (or the k3s service map, whichever currently lists cluster workloads), recording: runs in k3s, archive on the `astrograph` NFS export, watched by the "Seestar Sync" Kuma push monitor, and that it previously ran under docker-compose on a Mac until 2026-08-12.
 

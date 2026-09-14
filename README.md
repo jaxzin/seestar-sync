@@ -1,12 +1,27 @@
 # seestar-sync
 
-`seestar-sync` mirrors the media library on a Seestar S30 Pro to a NAS volume over SMB
+`seestar-sync` mirrors the media library on a Seestar S30 Pro to a NAS volume (NFS in production, SMB for the local compose path)
 and reclaims space on the telescope once the copy is verified, using a tiered,
 free-space-driven deletion policy. Deletion is allowlist-only: raw subframes go first,
 then videos, then stacked FITs — the stacked JPGs and thumbnails the Seestar app uses
 for in-app browsing are never touched, and never even reachable by the deleter.
 
-## Quick start (Mac)
+## Where it runs
+
+**Production runs in k3s**: the `platform/seestar-sync` ArgoCD app in
+`fallen-leaf/homelab-cluster` (cut over from the Mac on 2026-09-14). There the archive is
+the NAS `astrograph` export mounted over NFS, credentials come from OpenBao via External
+Secrets, and the "Seestar Sync" Uptime Kuma push monitor watches it. Change the
+deployment there, not here.
+
+The `docker-compose.yml` quick start below is for **local development and disaster
+recovery only**. Never run it against the production archive while the k3s pod is up:
+two primaries writing one archive will fight over `manifest.db`. Any second instance
+pointed at a live archive (a test deployment, a DR rehearsal) must set
+`SHADOW_MODE=true` with its own `MQTT_TOPIC_PREFIX` and `KUMA_PUSH_URL` (see
+Configuration).
+
+## Quick start (Mac, local dev / DR)
 
 1. Mount the NAS share in Finder first (e.g. `smb://nas.local/astro`), so a real volume
    backs the archive path you're about to bind-mount. If the archive directory turns
