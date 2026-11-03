@@ -1,5 +1,10 @@
 # seestar-sync
 
+> **Setting up the whole Seestar stack?** Start at the
+> [ha-seestar Quick Start](https://github.com/jaxzin/ha-seestar#quick-start-home-assistant-os--supervised).
+> It installs this backup add-on together with the telemetry bridge, the `seestar_alp`
+> driver and the dashboard card. This README covers seestar-sync on its own.
+
 `seestar-sync` mirrors the media library on a Seestar S30 Pro (read over SMB) to an archive volume
 and reclaims space on the telescope once the copy is verified, using a tiered,
 free-space-driven deletion policy. Deletion is allowlist-only: raw subframes go first,
