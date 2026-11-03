@@ -1,4 +1,4 @@
-# tofu/network — the Seestar S30's UniFi fixed-IP reservation
+# deploy/homelab/tofu/network — the Seestar S30's UniFi fixed-IP reservation
 
 | | |
 |---|---|

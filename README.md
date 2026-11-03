@@ -1,37 +1,55 @@
 # seestar-sync
 
-`seestar-sync` mirrors the media library on a Seestar S30 Pro to a NAS volume (NFS in production, SMB for the local compose path)
+`seestar-sync` mirrors the media library on a Seestar S30 Pro (read over SMB) to an archive volume
 and reclaims space on the telescope once the copy is verified, using a tiered,
 free-space-driven deletion policy. Deletion is allowlist-only: raw subframes go first,
 then videos, then stacked FITs — the stacked JPGs and thumbnails the Seestar app uses
 for in-app browsing are never touched, and never even reachable by the deleter.
 
-## Where it runs
+## Requirements
 
-**Production runs in k3s**: the `platform/seestar-sync` ArgoCD app in
-`fallen-leaf/homelab-cluster` (cut over from the Mac on 2026-09-14). There the archive is
-the NAS `astrograph` export mounted over NFS, credentials come from OpenBao via External
-Secrets, and the "Seestar Sync" Uptime Kuma push monitor watches it. Change the
-deployment there, not here.
+- A **Seestar S30 Pro** on your LAN, reachable over SMB (TCP 445) at a stable address — a
+  DHCP reservation is strongly recommended. Only the S30 Pro has been tested against the
+  real device; other Seestar models and firmware versions are untested and may differ
+  (see "Free-space measurement").
+- An **archive volume** that is reliably mounted wherever the container runs: a NAS
+  share or any large disk. The tool refuses to run if the archive shares a filesystem
+  with the container's own root.
+- **Docker** (Compose or Kubernetes) or Python 3.12+ with [`uv`](https://docs.astral.sh/uv/).
+  No prebuilt image is published: you build it from this repository.
+- Optional: an authenticated MQTT broker for Home Assistant, and an Uptime Kuma push
+  monitor.
 
-The `docker-compose.yml` quick start below is for **local development and disaster
-recovery only**. Never run it against the production archive while the k3s pod is up:
-two primaries writing one archive will fight over `manifest.db`. Any second instance
-pointed at a live archive (a test deployment, a DR rehearsal) must set
-`SHADOW_MODE=true` with its own `MQTT_TOPIC_PREFIX` and `KUMA_PUSH_URL` (see
-Configuration).
+## Deployment options
 
-## Quick start (Mac, local dev / DR)
+- **Docker Compose** — the quick start below.
+- **Kubernetes** — [`examples/kubernetes/seestar-sync.yaml`](examples/kubernetes/seestar-sync.yaml)
+  is a hardened single-replica Deployment (non-root, read-only root filesystem) with a
+  PVC, safe defaults (`DRY_RUN=true`, reclaim off), and `CHANGEME` markers.
+- **Bare Python** — `uv run seestar-sync daemon --init` with the variables from
+  Configuration set in your environment.
 
-1. Mount the NAS share in Finder first (e.g. `smb://nas.local/astro`), so a real volume
+Run exactly **one primary per archive**: two writers on one archive fight over
+`manifest.db`. Any second instance pointed at a live archive (a test deployment, a DR
+rehearsal) must set `SHADOW_MODE=true` with its own `MQTT_TOPIC_PREFIX` and
+`KUMA_PUSH_URL` (see Configuration).
+
+The maintainer's own deployment (k3s + ArgoCD, OpenBao, a UniFi reservation managed as
+code) lives in [`deploy/homelab/`](deploy/homelab/). It is site-specific; you do not
+need any of it.
+
+## Quick start (Docker Compose)
+
+1. Mount your archive volume first (a NAS share, e.g. `smb://nas.local/astro` in Finder on
+   a Mac, or an NFS/SMB mount on Linux), so a real volume
    backs the archive path you're about to bind-mount. If the archive directory turns
    out to share a filesystem with the container's own root, the tool refuses to run
    rather than risk copying into the container's ephemeral layer.
 2. Create a `.env` file next to `docker-compose.yml`:
 
    ```
-   SEESTAR_HOST=seestar.local
-   ARCHIVE_HOST_PATH=/Volumes/astro/seestar
+   SEESTAR_HOST=192.168.1.50                   # fixed IP recommended; seestar.local only where mDNS works
+   ARCHIVE_HOST_PATH=/Volumes/astro/seestar    # e.g. /mnt/astro/seestar on Linux
    ```
 
 3. Initialize the archive (first run only — creates the sentinel file and directory

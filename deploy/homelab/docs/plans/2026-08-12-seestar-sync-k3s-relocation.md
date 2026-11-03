@@ -8,7 +8,7 @@
 
 **Tech Stack:** Ansible (DSM Web API), k3s + ArgoCD, External Secrets Operator + OpenBao, kaniko, Gitea Actions, Python 3.12 / uv / pytest.
 
-**Spec:** `docs/superpowers/specs/2026-08-12-seestar-sync-k3s-relocation-design.md`
+**Spec:** `deploy/homelab/docs/specs/2026-08-12-seestar-sync-k3s-relocation-design.md`
 
 ## Global Constraints
 
