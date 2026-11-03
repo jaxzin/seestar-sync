@@ -113,3 +113,13 @@ on. Use a broker that requires a username and password.
 Only one primary may write an archive. If you already run seestar-sync elsewhere
 (Docker, Kubernetes) against the same archive, stop it first, or run this one
 with `shadow_mode: true` and a different `mqtt_topic_prefix`.
+
+A second instance, for example another telescope, needs **both**:
+
+- its own `archive_dir`, and
+- its own `mqtt_topic_prefix`.
+
+The prefix is also the MQTT client ID, so two instances sharing one prefix
+disconnect each other from the broker over and over. Both devices are named
+"Seestar Sync" in Home Assistant, so tell them apart by prefix (the device
+identifier), not by name. Entities of the second one get a `_2` suffix.
