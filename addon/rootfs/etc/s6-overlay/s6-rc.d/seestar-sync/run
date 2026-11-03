@@ -1,0 +1,7 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# Translate the add-on options into the daemon environment, then exec the daemon
+# (seestar_sync.addon does the mapping and replaces itself with the daemon, so
+# s6 signals reach it directly and it can finish its current file on stop).
+# A bad configuration exits non-zero with a message in the add-on log.
+exec python3 -m seestar_sync.addon

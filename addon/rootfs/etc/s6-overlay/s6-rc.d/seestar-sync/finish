@@ -1,0 +1,11 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# s6 runs this after the service exits; $1 is its exit code (256 = killed by a
+# signal). Exit 2 is the daemon's "configuration or archive problem" code (bad
+# option, archive on the container's own filesystem, ...). Restarting would only
+# repeat the same error every second, so stop the add-on and leave the message in
+# the log. Any other exit is left to s6 to restart.
+if [ "${1}" -eq 2 ]; then
+    echo "seestar-sync exited with a configuration error; stopping the add-on."
+    exec /run/s6/basedir/bin/halt
+fi

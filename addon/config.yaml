@@ -1,0 +1,73 @@
+# Home Assistant add-on manifest for Seestar Sync.
+#
+# The image is built by CI from this repository (addon/Dockerfile, context = repo
+# root) and published to GHCR as a multi-arch manifest; the Supervisor pulls the
+# tag named by `version`. Bump `version` (and pyproject.toml's) to release.
+name: Seestar Sync
+version: "0.3.0"
+slug: seestar_sync
+description: >-
+  Back up your Seestar S30 Pro's photos to your NAS or HA storage over SMB,
+  verify every copy, and optionally free space on the telescope.
+url: https://github.com/jaxzin/seestar-sync
+image: ghcr.io/jaxzin/seestar-sync-addon
+stage: experimental
+arch:
+  - aarch64
+  - amd64
+
+# The base image runs s6-overlay v3 as PID 1; the Docker default init must be off.
+init: false
+boot: auto
+startup: application
+
+# MQTT is optional: with mqtt_host blank the Supervisor's MQTT service (the
+# Mosquitto add-on) is used when present.
+services:
+  - mqtt:want
+
+# /media and /share are where Home Assistant mounts network storage
+# (Settings > System > Storage). The archive must live on one of them.
+map:
+  - media:rw
+  - share:rw
+
+options:
+  seestar_host: ""
+  archive_dir: /media/seestar
+  sync_interval_minutes: 15
+  active_window_minutes: 15
+  # Safety defaults: the add-on starts as a read-only rehearsal. It plans what it
+  # would copy and logs it, copies nothing, and deletes nothing. See DOCS.md.
+  dry_run: true
+  reclaim_enabled: false
+  reclaim_trigger_percent: 75
+  reclaim_target_percent: 60
+  device_capacity_gb: 128
+  kuma_push_url: ""
+  shadow_mode: false
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_topic_prefix: seestar-sync
+  log_level: info
+
+schema:
+  seestar_host: str
+  archive_dir: match(^/(media|share)/.+)
+  sync_interval_minutes: int(1,1440)
+  active_window_minutes: int(1,1440)
+  dry_run: bool
+  reclaim_enabled: bool
+  reclaim_trigger_percent: float(1,100)
+  reclaim_target_percent: float(1,100)
+  device_capacity_gb: float(1,)?
+  kuma_push_url: password?
+  shadow_mode: bool
+  mqtt_host: str?
+  mqtt_port: port
+  mqtt_username: str?
+  mqtt_password: password?
+  mqtt_topic_prefix: match(^[A-Za-z0-9_-]+$)
+  log_level: list(debug|info|warning|error|critical)
