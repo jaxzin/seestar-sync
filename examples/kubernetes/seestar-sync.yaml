@@ -1,0 +1,123 @@
+# Example: run seestar-sync as a single-replica Deployment.
+#
+# Everything marked CHANGEME is site-specific. Start in DRY_RUN with reclaim
+# off (the defaults below), review the logs for a few days, and only then
+# graduate (see "Rollout sequence" in the top-level README).
+#
+# Build and push the image to a registry your cluster can pull from first:
+#   docker build -t registry.example.com/seestar-sync:0.2.2 . && docker push ...
+#
+# Exactly ONE primary may write an archive. Keep replicas at 1 and the
+# strategy at Recreate so a rollout never runs two writers at once.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: seestar-sync
+---
+# Archive volume. The tool refuses to run if /archive shares a filesystem with
+# the container's own root, so this must be a real PersistentVolume (NFS, SMB
+# CSI, local-path, ...). Size it to hold your whole MyWorks/ library.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seestar-archive
+  namespace: seestar-sync
+spec:
+  accessModes: ["ReadWriteOnce"]    # CHANGEME: RWX if your storage supports it and you want it
+  resources:
+    requests:
+      storage: 500Gi                # CHANGEME
+  # storageClassName: CHANGEME
+---
+# Optional: only needed when MQTT_HOST is set. MQTT credentials are effectively
+# admin credentials for this tool (the command topics can arm deletion), so use
+# a dedicated broker user and manage this Secret with your normal secret tooling
+# instead of committing real values.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: seestar-sync-mqtt
+  namespace: seestar-sync
+type: Opaque
+stringData:
+  MQTT_USERNAME: CHANGEME
+  MQTT_PASSWORD: CHANGEME
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seestar-sync
+  namespace: seestar-sync
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: seestar-sync
+  template:
+    metadata:
+      labels:
+        app: seestar-sync
+    spec:
+      securityContext:
+        # The archive volume's ownership decides this. Pick the uid/gid that can
+        # write to it (or set fsGroup if your storage supports it).
+        runAsUser: 1000             # CHANGEME
+        runAsGroup: 1000            # CHANGEME
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: seestar-sync
+          image: registry.example.com/seestar-sync:0.2.2   # CHANGEME
+          # `daemon --init` is idempotent: it creates the archive sentinel and
+          # MyWorks/ layout on first run and is a no-op afterwards.
+          args: ["daemon", "--init"]
+          env:
+            - name: SEESTAR_HOST
+              # Prefer a fixed IP (DHCP reservation): pod networks usually have
+              # no mDNS, so seestar.local will not resolve.
+              value: "192.0.2.50"   # CHANGEME
+            - name: ARCHIVE_DIR
+              value: /archive
+            - name: SYNC_INTERVAL_MINUTES
+              value: "15"
+            - name: DRY_RUN
+              value: "true"         # flip to "false" only after reviewing dry-run logs
+            - name: RECLAIM_ENABLED
+              value: "false"        # deletion is opt-in; enable last
+            # The S30 Pro is 128 GB. Only used if the firmware will not answer a
+            # free-space query.
+            - name: DEVICE_CAPACITY_GB
+              value: "128"
+            # Optional Home Assistant integration (needs the Secret above).
+            # - name: MQTT_HOST
+            #   value: broker.example.com
+            # - name: MQTT_PORT
+            #   value: "1883"
+          # envFrom:
+          #   - secretRef:
+          #       name: seestar-sync-mqtt
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: archive
+              mountPath: /archive
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: archive
+          persistentVolumeClaim:
+            claimName: seestar-archive
+        - name: tmp
+          emptyDir: {}

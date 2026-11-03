@@ -20,11 +20,11 @@
 # cannot). Log in with an admin-capable method first; the script checks
 # capabilities before writing anything.
 #
-# Usage: scripts/seed-openbao-secrets.sh [--env-file PATH] [--force] [--rotate-push-token] [--dry-run]
+# Usage: deploy/homelab/scripts/seed-openbao-secrets.sh [--env-file PATH] [--force] [--rotate-push-token] [--dry-run]
 set -euo pipefail
 
 export VAULT_ADDR="${VAULT_ADDR:-https://openbao.forest-draconis.ts.net}"
-ENV_FILE="$(cd "$(dirname "$0")/.." && pwd)/.env"
+ENV_FILE="$(cd "$(dirname "$0")/../../.." && pwd)/.env"
 FORCE=0 ROTATE=0 DRY=0
 MQTT_PATH="secret/infra/seestar-sync/mqtt"
 PUSH_PATH="secret/infra/uptime-kuma/seestar-sync-push"

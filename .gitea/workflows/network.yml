@@ -1,4 +1,4 @@
-# Converges/validates the Seestar S30's UniFi fixed-IP reservation (tofu/network config,
+# Converges/validates the Seestar S30's UniFi fixed-IP reservation (deploy/homelab/tofu/network config,
 # consuming fallen-leaf/terraform-unifi-reservation pinned to a commit SHA).
 #
 # Jobs:
@@ -36,14 +36,14 @@
 #
 # Each read is a bootstrap gate: until the openbao-infra grant is merged and the
 # factory has run, the affected step fails with a message naming the fix. See
-# tofu/network/README.md.
+# deploy/homelab/tofu/network/README.md.
 name: network
 on:
   push:
     branches: [main]
-    paths: ["tofu/network/**", ".gitea/workflows/network.yml"]
+    paths: ["deploy/homelab/tofu/network/**", ".gitea/workflows/network.yml"]
   pull_request:
-    paths: ["tofu/network/**", ".gitea/workflows/network.yml"]
+    paths: ["deploy/homelab/tofu/network/**", ".gitea/workflows/network.yml"]
   schedule:
     - cron: "53 6 * * *"   # daily drift check
   workflow_dispatch:
@@ -130,7 +130,7 @@ jobs:
           trap 'rm -f /tmp/g.json "$HDR"' EXIT
           printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN" > "$HDR"
           curl -sf -H @"$HDR" "$OPENBAO_ADDR/v1/secret/data/infra/gitea/ci-read" -o /tmp/g.json \
-            || { echo "BOOTSTRAP GATE: store a gitea read token at secret/infra/gitea/ci-read (field: token) with read access to fallen-leaf/terraform-unifi-reservation — see tofu/network/README.md"; exit 1; }
+            || { echo "BOOTSTRAP GATE: store a gitea read token at secret/infra/gitea/ci-read (field: token) with read access to fallen-leaf/terraform-unifi-reservation — see deploy/homelab/tofu/network/README.md"; exit 1; }
           T=$(jq -r '.data.data.token // empty' /tmp/g.json)
           [ -n "$T" ] || { echo "secret/infra/gitea/ci-read missing 'token' field"; exit 1; }
           echo "::add-mask::$T"
@@ -146,7 +146,7 @@ jobs:
             -L "https://gitea.forest-draconis.ts.net/api/v1/repos/fallen-leaf/terraform-unifi-reservation")
           [ "$code" = "200" ] || { echo "TOKEN PROBE FAILED (HTTP $code): the token in secret/infra/gitea/ci-read cannot read fallen-leaf/terraform-unifi-reservation — re-mint with read:repository scope (and access to that repo)"; exit 1; }
       - name: fmt / init / validate (no backend)
-        working-directory: tofu/network
+        working-directory: deploy/homelab/tofu/network
         run: |
           tofu fmt -check -diff
           tofu init -backend=false -input=false
@@ -302,7 +302,7 @@ jobs:
           HDR=$(mktemp /tmp/b2.hdr.XXXXXX); chmod 600 "$HDR"
           printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN" > "$HDR"
           curl -sf -H @"$HDR" "$OPENBAO_ADDR/v1/secret/data/infra/b2/tofu-state" -o /tmp/b2.json \
-            || { echo "BOOTSTRAP GATE: store B2 state credentials at secret/infra/b2/tofu-state (fields: key_id, application_key, endpoint, region, bucket) — see tofu/network/README.md"; exit 1; }
+            || { echo "BOOTSTRAP GATE: store B2 state credentials at secret/infra/b2/tofu-state (fields: key_id, application_key, endpoint, region, bucket) — see deploy/homelab/tofu/network/README.md"; exit 1; }
           rm -f "$HDR"
           K=$(jq -r '.data.data.key_id // empty' /tmp/b2.json); S=$(jq -r '.data.data.application_key // empty' /tmp/b2.json)
           [ -n "$K" ] && [ -n "$S" ] || { echo "secret/infra/b2/tofu-state missing key_id/application_key"; exit 1; }
@@ -321,7 +321,7 @@ jobs:
           rm -f /tmp/b2.json
 
       - name: Plan (drift detection) or apply
-        working-directory: tofu/network
+        working-directory: deploy/homelab/tofu/network
         env:
           # Bind the dispatch input to a shell var instead of interpolating
           # the GitHub expression straight into the script text — a

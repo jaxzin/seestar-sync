@@ -1,6 +1,6 @@
 # seestar-sync k3s relocation — progress ledger
 
-Plan: docs/superpowers/plans/2026-08-12-seestar-sync-k3s-relocation.md
+Plan: deploy/homelab/docs/plans/2026-08-12-seestar-sync-k3s-relocation.md
 Execution mode: gates win — one task per merge, Brian merges each PR.
 
 Repos are EXTERNAL to this worktree:
