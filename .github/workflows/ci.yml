@@ -1,0 +1,241 @@
+# Tests and lints on every PR; on main also publishes two images to GHCR, each
+# tagged with the project version and `latest`. A version that is already
+# published is never overwritten: bump `version` in pyproject.toml (and
+# addon/config.yaml, which CI keeps equal) to release.
+#
+#   ghcr.io/jaxzin/seestar-sync         plain container: Docker Compose, Kubernetes
+#   ghcr.io/jaxzin/seestar-sync-addon   Home Assistant add-on (addon/config.yaml `image`)
+#
+# The homelab-only CI (.gitea/, deploy/homelab/) is not part of this workflow.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest + ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+      - run: uv run ruff check src/ tests/
+      - run: uv run pytest -q
+
+  lint:
+    name: Lint add-on and Dockerfiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck the s6 scripts
+        run: >-
+          shellcheck -s bash
+          addon/rootfs/etc/s6-overlay/s6-rc.d/seestar-sync/run
+          addon/rootfs/etc/s6-overlay/s6-rc.d/seestar-sync/finish
+
+      - name: Hadolint (add-on)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: addon/Dockerfile
+
+      - name: Hadolint (container)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Validate add-on manifest
+        run: |
+          python3 - <<'EOF'
+          import tomllib
+          import yaml
+
+          cfg = yaml.safe_load(open("addon/config.yaml"))
+          for key in ("name", "version", "slug", "description", "arch", "image"):
+              assert key in cfg, f"addon/config.yaml missing required key {key!r}"
+          assert set(cfg["options"]) == set(cfg["schema"]), "options/schema keys differ"
+
+          project = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          assert cfg["version"] == project, (
+              f"addon/config.yaml version {cfg['version']} != pyproject.toml {project}"
+          )
+
+          tr = yaml.safe_load(open("addon/translations/en.yaml"))["configuration"]
+          assert set(tr) == set(cfg["options"]), "translations/options keys differ"
+
+          # Never ship an add-on that starts armed.
+          assert cfg["options"]["dry_run"] is True, "dry_run must default to true"
+          assert cfg["options"]["reclaim_enabled"] is False, "reclaim_enabled must default to false"
+          print("add-on manifest ok:", cfg["slug"], cfg["version"])
+          EOF
+
+  # ---- plain container (Docker Compose, Kubernetes) ------------------------
+  container:
+    name: Container image
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/jaxzin/seestar-sync
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import tomllib
+          print("version=" + tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])
+          EOF
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether to publish
+        id: publish
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          elif docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "::notice::$IMAGE:$VERSION already exists; building without publishing. Bump the version to release."
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.publish.outputs.push }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---- Home Assistant add-on image -----------------------------------------
+  prepare:
+    name: Prepare add-on build
+    runs-on: ubuntu-latest
+    outputs:
+      architectures: ${{ steps.info.outputs.architectures }}
+      image_name: ${{ steps.info.outputs.image_name }}
+      registry_prefix: ${{ steps.info.outputs.registry_prefix }}
+      version: ${{ steps.info.outputs.version }}
+      name: ${{ steps.info.outputs.name }}
+      description: ${{ steps.info.outputs.description }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read addon/config.yaml
+        id: info
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json
+          import yaml
+
+          cfg = yaml.safe_load(open("addon/config.yaml"))
+          prefix, _, name = cfg["image"].rpartition("/")
+          print(f"architectures={json.dumps(cfg['arch'])}")
+          print(f"image_name={name}")
+          print(f"registry_prefix={prefix}")
+          print(f"version={cfg['version']}")
+          print(f"name={cfg['name']}")
+          print(f"description={' '.join(cfg['description'].split())}")
+          EOF
+
+      - name: Build matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@2026.09.0
+        with:
+          architectures: ${{ steps.info.outputs.architectures }}
+          image-name: ${{ steps.info.outputs.image_name }}
+          registry-prefix: ${{ steps.info.outputs.registry_prefix }}
+
+  addon:
+    name: Add-on ${{ matrix.arch }}
+    needs: [test, lint, prepare]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write   # Cosign keyless signing
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build image (pushed on main only)
+        uses: home-assistant/builder/actions/build-image@2026.09.0
+        with:
+          arch: ${{ matrix.arch }}
+          # Repository root as context: the add-on builds from the same source
+          # tree as the container image.
+          context: .
+          file: addon/Dockerfile
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+          version: ${{ needs.prepare.outputs.version }}
+          labels: |
+            io.hass.type=app
+            io.hass.name=${{ needs.prepare.outputs.name }}
+            io.hass.description=${{ needs.prepare.outputs.description }}
+            io.hass.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          push: ${{ env.PUBLISH }}
+          skip-existing: ${{ needs.prepare.outputs.version }}
+
+  manifest:
+    name: Publish add-on multi-arch manifest
+    needs: [prepare, addon]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      packages: write
+    steps:
+      - name: Publish multi-arch manifest
+        uses: home-assistant/builder/actions/publish-multi-arch-manifest@2026.09.0
+        with:
+          architectures: ${{ needs.prepare.outputs.architectures }}
+          image-name: ${{ needs.prepare.outputs.image_name }}
+          registry-prefix: ${{ needs.prepare.outputs.registry_prefix }}
+          image-tags: |
+            ${{ needs.prepare.outputs.version }}
+            latest
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          skip-existing: ${{ needs.prepare.outputs.version }}

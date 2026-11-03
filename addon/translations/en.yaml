@@ -1,0 +1,52 @@
+configuration:
+  seestar_host:
+    name: Telescope address
+    description: IP address or hostname of the Seestar. Give it a fixed IP in your router.
+  archive_dir:
+    name: Archive folder
+    description: Where backups are written, under /media or /share. Mount your NAS with Settings > System > Storage and use that path.
+  sync_interval_minutes:
+    name: Sync interval (minutes)
+    description: Minutes between sync passes.
+  active_window_minutes:
+    name: Active folder window (minutes)
+    description: A folder written to within this window is skipped for copying and deleting.
+  dry_run:
+    name: Dry run
+    description: Plan and log what would happen, but copy and delete nothing. Turn off once the log looks right.
+  reclaim_enabled:
+    name: Free space on the telescope
+    description: Allow deleting files from the telescope after they are verified as backed up. Leave off until you trust the backup.
+  reclaim_trigger_percent:
+    name: Reclaim trigger (%)
+    description: Start freeing space when the telescope is this full.
+  reclaim_target_percent:
+    name: Reclaim target (%)
+    description: Stop freeing space at this fullness. Must be below the trigger.
+  device_capacity_gb:
+    name: Telescope capacity (GB)
+    description: Used only if the firmware will not report free space. 128 for the S30 Pro.
+  kuma_push_url:
+    name: Uptime Kuma push URL
+    description: Optional heartbeat URL for an Uptime Kuma push monitor.
+  shadow_mode:
+    name: Shadow mode
+    description: Read-only observer of an archive another instance owns. Never copies or deletes.
+  mqtt_host:
+    name: MQTT host override
+    description: Leave blank to use the Mosquitto add-on automatically.
+  mqtt_port:
+    name: MQTT port override
+    description: Used only when the host override is set.
+  mqtt_username:
+    name: MQTT username override
+    description: Used only when the host override is set.
+  mqtt_password:
+    name: MQTT password override
+    description: Used only when the host override is set.
+  mqtt_topic_prefix:
+    name: MQTT topic prefix
+    description: Also the Home Assistant device name. Changing it creates a new device.
+  log_level:
+    name: Log level
+    description: Verbosity of the add-on log.

@@ -15,24 +15,44 @@ for in-app browsing are never touched, and never even reachable by the deleter.
 - An **archive volume** that is reliably mounted wherever the container runs: a NAS
   share or any large disk. The tool refuses to run if the archive shares a filesystem
   with the container's own root.
-- **Docker** (Compose or Kubernetes) or Python 3.12+ with [`uv`](https://docs.astral.sh/uv/).
-  No prebuilt image is published: you build it from this repository.
+- One of: **Home Assistant OS** (as an add-on), **Docker** (Compose or Kubernetes), or
+  Python 3.12+ with [`uv`](https://docs.astral.sh/uv/). Prebuilt multi-arch images
+  (amd64, arm64) are published to GHCR by CI; you can also build from this repository.
 - Optional: an authenticated MQTT broker for Home Assistant, and an Uptime Kuma push
   monitor.
 
 ## Deployment options
 
-- **Docker Compose** — the quick start below.
-- **Kubernetes** — [`examples/kubernetes/seestar-sync.yaml`](examples/kubernetes/seestar-sync.yaml)
-  is a hardened single-replica Deployment (non-root, read-only root filesystem) with a
-  PVC, safe defaults (`DRY_RUN=true`, reclaim off), and `CHANGEME` markers.
-- **Bare Python** — `uv run seestar-sync daemon --init` with the variables from
-  Configuration set in your environment.
+| Target | Image | Start here |
+|---|---|---|
+| **Home Assistant add-on** | `ghcr.io/jaxzin/seestar-sync-addon` | [Home Assistant add-on](#home-assistant-add-on) |
+| **Docker Compose** | `ghcr.io/jaxzin/seestar-sync` | [Quick start](#quick-start-docker-compose) |
+| **Kubernetes** | `ghcr.io/jaxzin/seestar-sync` | [`examples/kubernetes/seestar-sync.yaml`](examples/kubernetes/seestar-sync.yaml), a hardened single-replica Deployment (non-root, read-only root filesystem) with a PVC, safe defaults (`DRY_RUN=true`, reclaim off) and `CHANGEME` markers |
+| **Bare Python** | | `uv run seestar-sync daemon --init` with the variables from Configuration set in your environment |
+
+All of them run the same daemon. The Home Assistant add-on, the Compose file and the
+Kubernetes example start in `DRY_RUN=true` with reclaim off; the bare daemon defaults
+`DRY_RUN` to false, so set it yourself (see "Rollout sequence").
 
 Run exactly **one primary per archive**: two writers on one archive fight over
 `manifest.db`. Any second instance pointed at a live archive (a test deployment, a DR
 rehearsal) must set `SHADOW_MODE=true` with its own `MQTT_TOPIC_PREFIX` and
 `KUMA_PUSH_URL` (see Configuration).
+
+## Home Assistant add-on
+
+1. **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, add
+   `https://github.com/jaxzin/seestar-sync`, then install **Seestar Sync**.
+2. Mount your NAS under **Settings → System → Storage → Add network storage**
+   (name it `seestar`, usage **Media**).
+3. In the add-on's **Configuration**, set `seestar_host` to the telescope's IP address
+   and start it.
+
+It starts as a rehearsal (`dry_run: true`, `reclaim_enabled: false`): it logs what it
+would copy and changes nothing until you say so. The full first-run procedure, every
+option and troubleshooting are in [`addon/DOCS.md`](addon/DOCS.md). With the Mosquitto
+add-on installed, it appears as the **Seestar Sync** device with no MQTT setup. See
+[Home Assistant (MQTT)](#home-assistant-mqtt).
 
 The maintainer's own deployment (k3s + ArgoCD, OpenBao, a UniFi reservation managed as
 code) lives in [`deploy/homelab/`](deploy/homelab/). It is site-specific; you do not

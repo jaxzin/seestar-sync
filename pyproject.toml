@@ -1,6 +1,6 @@
 [project]
 name = "seestar-sync"
-version = "0.2.2"
+version = "0.3.0"
 description = "Mirror Seestar S30 Pro media to a NAS over SMB and reclaim device space, keeping stacked JPGs on-device"
 readme = "README.md"
 license = "MIT"
@@ -16,6 +16,7 @@ seestar-sync = "seestar_sync.cli:entrypoint"
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "pyyaml>=6.0.3",
     "ruff>=0.16.7",
 ]
 
